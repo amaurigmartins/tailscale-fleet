@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 TS_NAME="ts"
-TS_VERSION="4.0.1"
+TS_VERSION="4.2.0"
 DAEMON_APP="tailscale-user"   # Preserve compatibility with the earlier installer/state.
 
 BASE="${TAILSCALE_USER_HOME:-$HOME/.local/share/$DAEMON_APP}"
@@ -23,9 +23,13 @@ TAILSCALED="$BIN_DIR/tailscaled"
 
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}/$TS_NAME"
 RDP_CONFIG="${TS_RDP_CONFIG:-$CONFIG_HOME/rdp.tsv}"
+RDP_DIRECT_CONFIG="${TS_RDP_DIRECT_CONFIG:-$CONFIG_HOME/rdp-direct.tsv}"
 SSH_KEYS_CONFIG="${TS_SSH_KEYS_CONFIG:-$CONFIG_HOME/ssh-keys.tsv}"
+SSH_DIRECT_CONFIG="${TS_SSH_DIRECT_CONFIG:-$CONFIG_HOME/ssh-direct.tsv}"
 FLEET_CONFIG="${TS_FLEET_CONFIG:-$CONFIG_HOME/fleet.tsv}"
+FLEET_CREDENTIALS="${TS_FLEET_CREDENTIALS:-$CONFIG_HOME/credentials.tsv}"
 FLEET_IDENTITY="${TS_FLEET_IDENTITY:-$HOME/.ssh/ts-fleet-ed25519}"
+RDP_SECRET_SERVICE="${TS_RDP_SECRET_SERVICE:-tailscale-fleet-rdp}"
 RDP_STATE="$BASE/rdp"
 RDP_LOG="$RDP_STATE/bridge.log"
 RDP_PID="$RDP_STATE/bridge.pid"
@@ -126,7 +130,7 @@ latest_version() {
         | tail -n 1; } || true)"
     [[ -n "$package" ]] || die "could not determine latest stable Tailscale version"
     version="${package#tailscale_}"
-    version="${version%_${arch}.tgz}"
+    version="${version%_"${arch}".tgz}"
     printf '%s\n' "$version"
 }
 
@@ -362,6 +366,135 @@ format_arg_vector() {
     return 0
 }
 
+# Encode provider-specific direct-RDP options without exposing shell syntax in
+# the registry. The decoded fields are:
+# endpoint_libvirt_uri, endpoint_mac, lifecycle_libvirt_uri, start_policy,
+# boot_timeout, endpoint_address, endpoint_netdev, endpoint_guest_port.
+encode_direct_options() {
+    have python3 || die "python3 is required"
+    python3 - "$@" <<'PY_DIRECT_OPTIONS'
+import base64, json, sys
+
+(
+    endpoint_uri,
+    mac,
+    lifecycle_uri,
+    start_policy,
+    boot_timeout,
+    endpoint_address,
+    endpoint_netdev,
+    endpoint_guest_port,
+) = sys.argv[1:]
+payload = {
+    "boot_timeout": int(boot_timeout),
+    "endpoint_libvirt_uri": endpoint_uri,
+    "endpoint_mac": mac,
+    "lifecycle_libvirt_uri": lifecycle_uri,
+    "start_policy": start_policy,
+    "endpoint_address": endpoint_address,
+    "endpoint_netdev": endpoint_netdev,
+    "endpoint_guest_port": int(endpoint_guest_port),
+}
+raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+print(base64.urlsafe_b64encode(raw).decode("ascii"))
+PY_DIRECT_OPTIONS
+}
+
+decode_direct_options_nul() {
+    local encoded="${1:-}"
+    have python3 || die "python3 is required"
+    python3 - "$encoded" <<'PY_DIRECT_OPTIONS'
+import base64, json, sys
+
+defaults = {
+    "endpoint_libvirt_uri": "",
+    "endpoint_mac": "",
+    "lifecycle_libvirt_uri": "",
+    "start_policy": "manual",
+    "boot_timeout": 180,
+    "endpoint_address": "127.0.0.1",
+    "endpoint_netdev": "hostnet0",
+    "endpoint_guest_port": 3389,
+}
+try:
+    if sys.argv[1]:
+        value = json.loads(base64.urlsafe_b64decode(sys.argv[1].encode("ascii")).decode("utf-8"))
+        if not isinstance(value, dict):
+            raise ValueError("not an object")
+        defaults.update(value)
+    if defaults["start_policy"] not in {"manual", "on-demand"}:
+        raise ValueError("invalid start_policy")
+    timeout = int(defaults["boot_timeout"])
+    if not 1 <= timeout <= 3600:
+        raise ValueError("boot_timeout outside 1..3600")
+    guest_port = int(defaults["endpoint_guest_port"])
+    if not 1 <= guest_port <= 65535:
+        raise ValueError("endpoint_guest_port outside 1..65535")
+except Exception as exc:
+    raise SystemExit(f"invalid encoded direct-RDP options: {exc}")
+
+out = sys.stdout.buffer
+for item in (
+    str(defaults["endpoint_libvirt_uri"]),
+    str(defaults["endpoint_mac"]),
+    str(defaults["lifecycle_libvirt_uri"]),
+    str(defaults["start_policy"]),
+    str(timeout),
+    str(defaults["endpoint_address"]),
+    str(defaults["endpoint_netdev"]),
+    str(guest_port),
+):
+    out.write(item.encode("utf-8") + b"\0")
+PY_DIRECT_OPTIONS
+}
+
+DIRECT_ENDPOINT_URI=""
+DIRECT_ENDPOINT_MAC=""
+DIRECT_LIFECYCLE_URI=""
+DIRECT_START_POLICY="manual"
+DIRECT_BOOT_TIMEOUT="180"
+DIRECT_ENDPOINT_ADDRESS="127.0.0.1"
+DIRECT_ENDPOINT_NETDEV="hostnet0"
+DIRECT_ENDPOINT_GUEST_PORT="3389"
+
+decode_direct_options() {
+    local -a fields=()
+    mapfile -d '' -t fields < <(decode_direct_options_nul "${1:-}")
+    DIRECT_ENDPOINT_URI="${fields[0]:-}"
+    DIRECT_ENDPOINT_MAC="${fields[1]:-}"
+    DIRECT_LIFECYCLE_URI="${fields[2]:-}"
+    DIRECT_START_POLICY="${fields[3]:-manual}"
+    DIRECT_BOOT_TIMEOUT="${fields[4]:-180}"
+    DIRECT_ENDPOINT_ADDRESS="${fields[5]:-127.0.0.1}"
+    DIRECT_ENDPOINT_NETDEV="${fields[6]:-hostnet0}"
+    DIRECT_ENDPOINT_GUEST_PORT="${fields[7]:-3389}"
+}
+
+validate_registry_field() {
+    local label="$1" value="$2"
+    [[ "$value" != *'|'* && "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+        || die "$label may not contain pipe or newline characters"
+}
+
+validate_direct_host() {
+    local host="$1"
+    [[ -n "$host" && "$host" != -* && "$host" =~ ^[A-Za-z0-9._-]+$ ]] \
+        || die "invalid direct RDP host/address: $host"
+}
+
+normalize_mac() {
+    local mac="${1,,}"
+    [[ "$mac" =~ ^([0-9a-f]{2}:){5}[0-9a-f]{2}$ ]] \
+        || die "invalid MAC address: $1"
+    printf '%s\n' "$mac"
+}
+
+validate_boot_timeout() {
+    if [[ ! "$1" =~ ^[0-9]+$ ]] || (( 10#$1 < 1 || 10#$1 > 3600 )); then
+        die "boot timeout must be between 1 and 3600 seconds"
+    fi
+}
+
 # -----------------------------------------------------------------------------
 # RDP binding registry
 # Pipe-delimited columns: name target local_ip username remote_port server_name freerdp_args_b64
@@ -383,8 +516,9 @@ validate_rdp_name() {
 }
 
 validate_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && (( 1 <= 10#$1 && 10#$1 <= 65535 )) \
-        || die "invalid TCP port: $1"
+    if [[ ! "$1" =~ ^[0-9]+$ ]] || (( 10#$1 < 1 || 10#$1 > 65535 )); then
+        die "invalid TCP port: $1"
+    fi
 }
 
 validate_loopback_ip() {
@@ -529,6 +663,12 @@ rdp_remove() {
     mv "$tmp" "$RDP_CONFIG"
     chmod 600 "$RDP_CONFIG" 2>/dev/null || true
     log "removed RDP binding: $name"
+
+    # A direct mapping is meaningful only as an alternate transport for an
+    # existing portable RDP binding. Avoid leaving an unusable local record.
+    if rdp_direct_record "$name" >/dev/null 2>&1; then
+        rdp_direct_remove "$name"
+    fi
 
     if rdp_bridge_running; then
         if rdp_has_bindings; then rdp_restart; else rdp_stop; fi
@@ -685,10 +825,750 @@ rdp_args() {
     log "persistent FreeRDP args for $name: $(format_arg_vector "$args_b64")"
 }
 
-rdp_launch() {
-    [[ $# -ge 1 ]] || die "usage: ts rdp MACHINE [--] [extra FreeRDP arguments...]"
+ensure_rdp_direct_config() {
+    mkdir -p "$CONFIG_HOME" "$(dirname "$RDP_DIRECT_CONFIG")"
+    touch "$RDP_DIRECT_CONFIG"
+    chmod 600 "$RDP_DIRECT_CONFIG" 2>/dev/null || true
+}
+
+# Host-local registry columns:
+# name | endpoint_provider | endpoint_value | port |
+# lifecycle_provider | lifecycle_value | provider_options_b64
+# This file is intentionally outside config-install's portable merge set.
+
+rdp_direct_has_mappings() {
+    [[ -f "$RDP_DIRECT_CONFIG" ]] && grep -qEv '^[[:space:]]*(#|$)' "$RDP_DIRECT_CONFIG"
+}
+
+rdp_direct_count() {
+    if [[ -f "$RDP_DIRECT_CONFIG" ]]; then
+        awk '!/^[[:space:]]*(#|$)/ {count++} END {print count+0}' "$RDP_DIRECT_CONFIG"
+    else
+        printf '0\n'
+    fi
+}
+
+rdp_direct_record() {
+    local name="$1"
+    [[ -f "$RDP_DIRECT_CONFIG" ]] || return 1
+    awk -F '|' -v n="$name" '$1 == n { print; found=1; exit } END { if (!found) exit 1 }' "$RDP_DIRECT_CONFIG"
+}
+
+rdp_direct_write_record() {
+    local name="$1" endpoint_provider="$2" endpoint_value="$3" port="$4"
+    local lifecycle_provider="$5" lifecycle_value="$6" options_b64="$7" tmp sorted
+    ensure_rdp_direct_config
+    tmp="$(mktemp "$(dirname "$RDP_DIRECT_CONFIG")/.rdp-direct.XXXXXX")"
+    sorted="$(mktemp "$(dirname "$RDP_DIRECT_CONFIG")/.rdp-direct-sort.XXXXXX")"
+    awk -F '|' -v n="$name" '$1 != n' "$RDP_DIRECT_CONFIG" > "$tmp" || true
+    printf '%s|%s|%s|%s|%s|%s|%s\n' \
+        "$name" "$endpoint_provider" "$endpoint_value" "$port" \
+        "$lifecycle_provider" "$lifecycle_value" "$options_b64" >> "$tmp"
+    sort -t '|' -k1,1 "$tmp" > "$sorted"
+    mv "$sorted" "$RDP_DIRECT_CONFIG"
+    rm -f "$tmp"
+    chmod 600 "$RDP_DIRECT_CONFIG" 2>/dev/null || true
+}
+
+rdp_direct_set() {
+    [[ $# -ge 1 ]] || die "usage: ts rdp direct set NAME (--libvirt-user-domain DOMAIN | --libvirt-domain DOMAIN | --vmx PATH | --address HOST) [--port PORT]"
     local name="$1"; shift
-    [[ "${1:-}" == "--" ]] && shift
+    validate_rdp_name "$name"
+    rdp_record "$name" >/dev/null 2>&1 \
+        || die "unknown RDP binding '$name'; add it first with: ts rdp add $name [TARGET]"
+
+    local old="" old_port="" lifecycle_provider="" lifecycle_value="" old_options=""
+    old="$(rdp_direct_record "$name" 2>/dev/null || true)"
+    if [[ -n "$old" ]]; then
+        IFS='|' read -r _ _ _ old_port lifecycle_provider lifecycle_value old_options <<<"$old"
+        decode_direct_options "$old_options"
+    else
+        DIRECT_ENDPOINT_URI=""
+        DIRECT_ENDPOINT_MAC=""
+        DIRECT_LIFECYCLE_URI=""
+        DIRECT_START_POLICY="manual"
+        DIRECT_BOOT_TIMEOUT="180"
+        DIRECT_ENDPOINT_ADDRESS="127.0.0.1"
+        DIRECT_ENDPOINT_NETDEV="hostnet0"
+        DIRECT_ENDPOINT_GUEST_PORT="3389"
+    fi
+
+    local endpoint_provider="" endpoint_value="" port="${old_port:-3389}"
+    local endpoint_uri="" endpoint_mac="" endpoint_address="127.0.0.1"
+    local endpoint_netdev="hostnet0" endpoint_guest_port="3389" selectors=0 user_forward_options=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --libvirt-user-domain)
+                [[ $# -ge 2 ]] || die "--libvirt-user-domain requires a value"
+                endpoint_provider="libvirt-user"; endpoint_value="$2"; ((selectors+=1)); shift 2 ;;
+            --libvirt-domain)
+                [[ $# -ge 2 ]] || die "--libvirt-domain requires a value"
+                endpoint_provider="libvirt"; endpoint_value="$2"; ((selectors+=1)); shift 2 ;;
+            --vmx)
+                [[ $# -ge 2 ]] || die "--vmx requires a value"
+                endpoint_provider="vmware"; endpoint_value="$2"; ((selectors+=1)); shift 2 ;;
+            --address)
+                [[ $# -ge 2 ]] || die "--address requires a value"
+                endpoint_provider="address"; endpoint_value="$2"; ((selectors+=1)); shift 2 ;;
+            --libvirt-uri)
+                [[ $# -ge 2 ]] || die "--libvirt-uri requires a value"
+                endpoint_uri="$2"; shift 2 ;;
+            --mac)
+                [[ $# -ge 2 ]] || die "--mac requires a value"
+                endpoint_mac="$(normalize_mac "$2")"; shift 2 ;;
+            --host-address)
+                [[ $# -ge 2 ]] || die "--host-address requires a value"
+                endpoint_address="$2"; ((user_forward_options+=1)); shift 2 ;;
+            --netdev)
+                [[ $# -ge 2 ]] || die "--netdev requires a value"
+                endpoint_netdev="$2"; ((user_forward_options+=1)); shift 2 ;;
+            --guest-port)
+                [[ $# -ge 2 ]] || die "--guest-port requires a value"
+                endpoint_guest_port="$2"; ((user_forward_options+=1)); shift 2 ;;
+            --port)
+                [[ $# -ge 2 ]] || die "--port requires a value"
+                port="$2"; shift 2 ;;
+            *) die "unknown direct endpoint option: $1" ;;
+        esac
+    done
+    (( selectors == 1 )) || die "choose exactly one endpoint: --libvirt-user-domain, --libvirt-domain, --vmx, or --address"
+    validate_port "$port"
+    validate_port "$endpoint_guest_port"
+    validate_registry_field "direct endpoint" "$endpoint_value"
+    validate_registry_field "libvirt URI" "$endpoint_uri"
+    [[ "$endpoint_value" != -* ]] || die "direct endpoint values may not begin with '-'"
+    case "$endpoint_provider" in
+        libvirt|libvirt-user)
+            [[ -n "$endpoint_value" ]] || die "libvirt domain may not be empty" ;;
+        vmware)
+            [[ "$endpoint_value" == /* ]] || die "VMX path must be absolute" ;;
+        address)
+            validate_direct_host "$endpoint_value"
+            [[ -z "$endpoint_uri" ]] || die "--libvirt-uri is valid only with a libvirt endpoint"
+            [[ -z "$endpoint_mac" ]] || die "--mac is valid only with --libvirt-domain" ;;
+    esac
+    if [[ "$endpoint_provider" != libvirt && -n "$endpoint_mac" ]]; then
+        die "--mac is valid only with --libvirt-domain"
+    fi
+    if [[ "$endpoint_provider" != libvirt && "$endpoint_provider" != libvirt-user && -n "$endpoint_uri" ]]; then
+        die "--libvirt-uri is valid only with a libvirt endpoint"
+    fi
+    if [[ "$endpoint_provider" == libvirt-user ]]; then
+        validate_direct_host "$endpoint_address"
+        [[ -n "$endpoint_netdev" && "$endpoint_netdev" != -* && "$endpoint_netdev" =~ ^[A-Za-z0-9._-]+$ ]] \
+            || die "invalid QEMU user-network netdev: $endpoint_netdev"
+    elif (( user_forward_options )); then
+        die "--host-address, --netdev, and --guest-port are valid only with --libvirt-user-domain"
+    fi
+
+    # A provider-backed endpoint gets a matching manual lifecycle by default.
+    # Updates preserve any independently configured lifecycle.
+    if [[ -z "$old" ]]; then
+        case "$endpoint_provider" in
+            libvirt|libvirt-user)
+                lifecycle_provider="libvirt"; lifecycle_value="$endpoint_value"; DIRECT_LIFECYCLE_URI="$endpoint_uri" ;;
+            vmware)
+                lifecycle_provider="vmware"; lifecycle_value="$endpoint_value" ;;
+            address)
+                lifecycle_provider="none"; lifecycle_value="" ;;
+        esac
+    fi
+    DIRECT_ENDPOINT_URI="$endpoint_uri"
+    DIRECT_ENDPOINT_MAC="$endpoint_mac"
+    DIRECT_ENDPOINT_ADDRESS="$endpoint_address"
+    DIRECT_ENDPOINT_NETDEV="$endpoint_netdev"
+    DIRECT_ENDPOINT_GUEST_PORT="$endpoint_guest_port"
+    local options_b64
+    options_b64="$(encode_direct_options "$DIRECT_ENDPOINT_URI" "$DIRECT_ENDPOINT_MAC" \
+        "$DIRECT_LIFECYCLE_URI" "$DIRECT_START_POLICY" "$DIRECT_BOOT_TIMEOUT" \
+        "$DIRECT_ENDPOINT_ADDRESS" "$DIRECT_ENDPOINT_NETDEV" "$DIRECT_ENDPOINT_GUEST_PORT")"
+    rdp_direct_write_record "$name" "$endpoint_provider" "$endpoint_value" "$port" \
+        "${lifecycle_provider:-none}" "$lifecycle_value" "$options_b64"
+    log "direct RDP endpoint '$name': $endpoint_provider $endpoint_value:$port"
+}
+
+rdp_direct_lifecycle_set() {
+    [[ $# -ge 1 ]] || die "usage: ts rdp direct lifecycle set NAME (--libvirt-domain DOMAIN | --vmx PATH) [--start-policy manual|on-demand]"
+    local name="$1"; shift
+    local record endpoint_provider endpoint_value port options_b64
+    record="$(rdp_direct_record "$name" 2>/dev/null || true)"
+    [[ -n "$record" ]] || die "no direct RDP mapping for '$name'; configure its endpoint first"
+    IFS='|' read -r _ endpoint_provider endpoint_value port _ _ options_b64 <<<"$record"
+    decode_direct_options "$options_b64"
+
+    local provider="" value="" lifecycle_uri="" policy="$DIRECT_START_POLICY" timeout="$DIRECT_BOOT_TIMEOUT" selectors=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --libvirt-domain)
+                [[ $# -ge 2 ]] || die "--libvirt-domain requires a value"
+                provider="libvirt"; value="$2"; ((selectors+=1)); shift 2 ;;
+            --vmx)
+                [[ $# -ge 2 ]] || die "--vmx requires a value"
+                provider="vmware"; value="$2"; ((selectors+=1)); shift 2 ;;
+            --libvirt-uri)
+                [[ $# -ge 2 ]] || die "--libvirt-uri requires a value"
+                lifecycle_uri="$2"; shift 2 ;;
+            --start-policy)
+                [[ $# -ge 2 ]] || die "--start-policy requires a value"
+                policy="$2"; shift 2 ;;
+            --start-on-connect)
+                policy="on-demand"; shift ;;
+            --boot-timeout)
+                [[ $# -ge 2 ]] || die "--boot-timeout requires a value"
+                timeout="$2"; shift 2 ;;
+            *) die "unknown direct lifecycle option: $1" ;;
+        esac
+    done
+    (( selectors == 1 )) || die "choose exactly one lifecycle provider: --libvirt-domain or --vmx"
+    case "$policy" in manual|on-demand) ;; *) die "start policy must be manual or on-demand" ;; esac
+    validate_boot_timeout "$timeout"
+    validate_registry_field "lifecycle value" "$value"
+    validate_registry_field "libvirt URI" "$lifecycle_uri"
+    [[ -n "$value" && "$value" != -* ]] || die "invalid lifecycle value"
+    if [[ "$provider" == vmware ]]; then
+        [[ "$value" == /* ]] || die "VMX path must be absolute"
+        [[ -z "$lifecycle_uri" ]] || die "--libvirt-uri is valid only with --libvirt-domain"
+    fi
+    options_b64="$(encode_direct_options "$DIRECT_ENDPOINT_URI" "$DIRECT_ENDPOINT_MAC" \
+        "$lifecycle_uri" "$policy" "$timeout" "$DIRECT_ENDPOINT_ADDRESS" \
+        "$DIRECT_ENDPOINT_NETDEV" "$DIRECT_ENDPOINT_GUEST_PORT")"
+    rdp_direct_write_record "$name" "$endpoint_provider" "$endpoint_value" "${port:-3389}" \
+        "$provider" "$value" "$options_b64"
+    log "direct RDP lifecycle '$name': $provider $value ($policy)"
+}
+
+rdp_direct_lifecycle_remove() {
+    [[ $# -eq 1 ]] || die "usage: ts rdp direct lifecycle rm NAME"
+    local name="$1" record endpoint_provider endpoint_value port provider value options_b64
+    record="$(rdp_direct_record "$name" 2>/dev/null || true)"
+    [[ -n "$record" ]] || die "no direct RDP mapping for '$name'"
+    IFS='|' read -r _ endpoint_provider endpoint_value port provider value options_b64 <<<"$record"
+    decode_direct_options "$options_b64"
+    options_b64="$(encode_direct_options "$DIRECT_ENDPOINT_URI" "$DIRECT_ENDPOINT_MAC" "" manual \
+        "$DIRECT_BOOT_TIMEOUT" "$DIRECT_ENDPOINT_ADDRESS" "$DIRECT_ENDPOINT_NETDEV" \
+        "$DIRECT_ENDPOINT_GUEST_PORT")"
+    rdp_direct_write_record "$name" "$endpoint_provider" "$endpoint_value" "${port:-3389}" none "" "$options_b64"
+    log "removed lifecycle provider from direct RDP mapping: $name"
+}
+
+rdp_direct_remove() {
+    [[ $# -eq 1 ]] || die "usage: ts rdp direct rm NAME"
+    local name="$1" tmp
+    rdp_direct_record "$name" >/dev/null 2>&1 || die "no direct RDP mapping for '$name'"
+    ensure_rdp_direct_config
+    tmp="$(mktemp "$(dirname "$RDP_DIRECT_CONFIG")/.rdp-direct.XXXXXX")"
+    awk -F '|' -v n="$name" '$1 != n' "$RDP_DIRECT_CONFIG" > "$tmp" || true
+    mv "$tmp" "$RDP_DIRECT_CONFIG"
+    chmod 600 "$RDP_DIRECT_CONFIG" 2>/dev/null || true
+    log "removed direct RDP mapping: $name"
+}
+
+direct_virsh_base() {
+    local -n command_ref="$1"
+    local uri="$2"
+    command_ref=(virsh)
+    [[ -n "$uri" ]] && command_ref+=(--connect "$uri")
+}
+
+direct_libvirt_state() {
+    local domain="$1" uri="$2" output
+    have virsh || return 127
+    local -a command
+    direct_virsh_base command "$uri"
+    if ! output="$("${command[@]}" domstate "$domain" 2>/dev/null)"; then return 1; fi
+    awk 'NF {gsub(/^[[:space:]]+|[[:space:]]+$/, ""); print tolower($0); exit}' <<<"$output"
+}
+
+direct_vmware_running() {
+    local vmx="$1" output
+    have vmrun || return 127
+    output="$(vmrun list 2>/dev/null)" || return 1
+    grep -Fxq -- "$vmx" <<<"$output"
+}
+
+direct_lifecycle_state() {
+    local provider="$1" value="$2" uri="$3" state
+    case "$provider" in
+        none|'') printf 'unmanaged\n' ;;
+        libvirt)
+            if state="$(direct_libvirt_state "$value" "$uri")"; then printf '%s\n' "$state"; else return $?; fi ;;
+        vmware)
+            if direct_vmware_running "$value"; then printf 'running\n'; else
+                local rc=$?; (( rc == 1 )) && printf 'shut off\n' || return "$rc"
+            fi ;;
+        *) return 2 ;;
+    esac
+}
+
+direct_lifecycle_prepare() {
+    local provider="$1" value="$2" uri="$3" policy="$4" state rc
+    [[ "$provider" != none && -n "$provider" ]] || return 0
+    if state="$(direct_lifecycle_state "$provider" "$value" "$uri")"; then
+        :
+    else
+        rc=$?
+        (( rc == 127 )) && die "$([[ "$provider" == libvirt ]] && printf virsh || printf vmrun) is required for the configured lifecycle provider"
+        die "unable to query $provider lifecycle state for '$value'"
+    fi
+    [[ "$state" != running ]] || return 0
+    [[ "$policy" == on-demand ]] \
+        || die "$provider VM '$value' is not running (state: $state); start it or configure --start-policy on-demand"
+    case "$provider" in
+        libvirt)
+            local -a command
+            direct_virsh_base command "$uri"
+            "${command[@]}" start "$value" >/dev/null \
+                || die "failed to start libvirt domain '$value'" ;;
+        vmware)
+            vmrun start "$value" nogui >/dev/null \
+                || die "failed to start VMware VM '$value'" ;;
+    esac
+    log "started $provider VM '$value' on demand"
+}
+
+# QEMU user-mode host forwards are runtime state. Ensure the requested forward
+# exists after every VM start, and verify it because HMP can report errors as
+# successful command invocations.
+direct_prepare_libvirt_user() {
+    local domain="$1" uri="$2" host="$3" host_port="$4" guest_port="$5" netdev="$6"
+    local state output specification monitor_ready=0
+    have virsh || die "virsh is required for libvirt-user direct endpoints"
+    state="$(direct_libvirt_state "$domain" "$uri" 2>/dev/null || true)"
+    [[ "$state" == running ]] \
+        || die "libvirt domain '$domain' must be running before its QEMU user-network forward can be prepared"
+
+    local -a command
+    direct_virsh_base command "$uri"
+    for _ in {1..40}; do
+        if output="$("${command[@]}" qemu-monitor-command "$domain" --hmp "info usernet" 2>/dev/null)"; then
+            monitor_ready=1
+            break
+        fi
+        sleep 0.25
+    done
+    (( monitor_ready )) || die "unable to inspect QEMU user networking for libvirt domain '$domain'"
+    if awk -v host="$host" -v hp="$host_port" -v gp="$guest_port" \
+        '$1 == "TCP[HOST_FORWARD]" && $3 == host && $4 == hp && $6 == gp {found=1} END {exit !found}' <<<"$output"; then
+        return 0
+    fi
+    if awk -v host="$host" -v hp="$host_port" \
+        '$1 == "TCP[HOST_FORWARD]" && $3 == host && $4 == hp {found=1} END {exit !found}' <<<"$output"; then
+        die "QEMU user-network port $host:$host_port is already forwarded to a different guest port"
+    fi
+
+    specification="hostfwd_add $netdev tcp:${host}:${host_port}-:${guest_port}"
+    "${command[@]}" qemu-monitor-command "$domain" --hmp "$specification" >/dev/null 2>&1 || true
+    output="$("${command[@]}" qemu-monitor-command "$domain" --hmp "info usernet" 2>/dev/null)" \
+        || die "unable to verify QEMU user-network forward for libvirt domain '$domain'"
+    awk -v host="$host" -v hp="$host_port" -v gp="$guest_port" \
+        '$1 == "TCP[HOST_FORWARD]" && $3 == host && $4 == hp && $6 == gp {found=1} END {exit !found}' <<<"$output" \
+        || die "failed to create QEMU user-network forward $host:$host_port -> guest :$guest_port on $netdev"
+    log "prepared QEMU user-network forward $host:$host_port -> '$domain':$guest_port"
+}
+
+direct_prepare_endpoint() {
+    local provider="$1" value="$2" port="$3" endpoint_uri="$4"
+    local endpoint_address="$5" endpoint_netdev="$6" endpoint_guest_port="$7"
+    case "$provider" in
+        libvirt-user)
+            direct_prepare_libvirt_user "$value" "$endpoint_uri" "$endpoint_address" \
+                "$port" "$endpoint_guest_port" "$endpoint_netdev" ;;
+    esac
+}
+
+DIRECT_RESOLVED_HOST=""
+DIRECT_RESOLVED_SOURCE=""
+DIRECT_RESOLVE_ERROR=""
+
+direct_filter_libvirt_addresses() {
+    local allowed_macs="$1" wanted_mac="$2"
+    python3 -c '
+import ipaddress, re, sys
+allowed = set(filter(None, sys.argv[1].lower().split(",")))
+wanted = sys.argv[2].lower()
+cgnat = ipaddress.ip_network("100.64.0.0/10")
+zero = ipaddress.ip_network("0.0.0.0/8")
+found = set()
+for line in sys.stdin:
+    match = re.search(r"(?i)(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", line)
+    if not match:
+        continue
+    mac = match.group(0).lower()
+    if mac not in allowed or (wanted and mac != wanted):
+        continue
+    for token in line.split():
+        try:
+            interface = ipaddress.ip_interface(token)
+        except ValueError:
+            continue
+        ip = interface.ip
+        if ip.version != 4 or ip in zero or ip.is_loopback or ip.is_link_local or ip in cgnat:
+            continue
+        found.add((str(ip), mac))
+for ip, mac in sorted(found, key=lambda item: (ipaddress.ip_address(item[0]), item[1])):
+    print(f"{ip}|{mac}")
+' "$allowed_macs" "$wanted_mac"
+}
+
+direct_resolve_libvirt() {
+    local domain="$1" uri="$2" wanted_mac="$3" state output source allowed_macs=""
+    have virsh || { DIRECT_RESOLVE_ERROR="virsh is required for libvirt direct endpoints"; return 1; }
+    have python3 || { DIRECT_RESOLVE_ERROR="python3 is required for direct endpoint validation"; return 1; }
+    if ! state="$(direct_libvirt_state "$domain" "$uri")"; then
+        DIRECT_RESOLVE_ERROR="unable to query libvirt domain '$domain'"
+        return 1
+    fi
+    if [[ "$state" != running ]]; then
+        DIRECT_RESOLVE_ERROR="libvirt domain '$domain' is not running (state: $state)"
+        return 1
+    fi
+    local -a command macs=() candidates=()
+    direct_virsh_base command "$uri"
+    if ! output="$("${command[@]}" domiflist "$domain" 2>/dev/null)"; then
+        DIRECT_RESOLVE_ERROR="unable to inspect interfaces for libvirt domain '$domain'"
+        return 1
+    fi
+    mapfile -t macs < <(awk '{v=tolower($NF); if (v ~ /^([0-9a-f][0-9a-f]:){5}[0-9a-f][0-9a-f]$/) print v}' <<<"$output" | sort -u)
+    (( ${#macs[@]} )) || { DIRECT_RESOLVE_ERROR="libvirt domain '$domain' exposes no identifiable NICs"; return 1; }
+    allowed_macs="$(IFS=,; printf '%s' "${macs[*]}")"
+    if [[ -n "$wanted_mac" ]]; then
+        local found=0 mac
+        for mac in "${macs[@]}"; do [[ "$mac" == "$wanted_mac" ]] && found=1; done
+        (( found )) || { DIRECT_RESOLVE_ERROR="configured MAC $wanted_mac is not attached to libvirt domain '$domain'"; return 1; }
+    fi
+
+    for source in lease agent arp; do
+        if ! output="$("${command[@]}" domifaddr "$domain" --source "$source" 2>/dev/null)"; then
+            continue
+        fi
+        mapfile -t candidates < <(direct_filter_libvirt_addresses "$allowed_macs" "$wanted_mac" <<<"$output")
+        if (( ${#candidates[@]} == 1 )); then
+            IFS='|' read -r DIRECT_RESOLVED_HOST _ <<<"${candidates[0]}"
+            DIRECT_RESOLVED_SOURCE="$source"
+            return 0
+        fi
+        if (( ${#candidates[@]} > 1 )); then
+            DIRECT_RESOLVE_ERROR="multiple direct IPv4 interfaces found for '$domain' from $source: ${candidates[*]}; configure --mac"
+            return 1
+        fi
+    done
+    DIRECT_RESOLVE_ERROR="unable to determine a direct address for libvirt domain '$domain'; install/enable qemu-guest-agent or configure an explicit --address/--mac mapping"
+    return 1
+}
+
+direct_resolve_vmware() {
+    local vmx="$1" output
+    have vmrun || { DIRECT_RESOLVE_ERROR="vmrun is required for VMware direct endpoints"; return 1; }
+    have python3 || { DIRECT_RESOLVE_ERROR="python3 is required for direct endpoint validation"; return 1; }
+    if ! direct_vmware_running "$vmx"; then
+        DIRECT_RESOLVE_ERROR="VMware VM '$vmx' is not running"
+        return 1
+    fi
+    if ! output="$(vmrun getGuestIPAddress "$vmx" 2>/dev/null)"; then
+        DIRECT_RESOLVE_ERROR="VMware Tools did not provide an address for '$vmx'"
+        return 1
+    fi
+    local resolved
+    resolved="$(python3 - "$output" <<'PY_VMWARE_IP'
+import ipaddress, re, sys
+text = sys.argv[1]
+valid = []
+for token in re.findall(r"(?:\d{1,3}\.){3}\d{1,3}", text):
+    try:
+        ip = ipaddress.ip_address(token)
+    except ValueError:
+        continue
+    if ip.version != 4 or ip in ipaddress.ip_network("0.0.0.0/8") or ip.is_loopback or ip.is_link_local or ip in ipaddress.ip_network("100.64.0.0/10"):
+        continue
+    if str(ip) not in valid:
+        valid.append(str(ip))
+if len(valid) != 1:
+    raise SystemExit(1)
+print(valid[0])
+PY_VMWARE_IP
+)" || {
+        DIRECT_RESOLVE_ERROR="VMware Tools returned no unique usable direct IPv4 address for '$vmx'"
+        return 1
+    }
+    DIRECT_RESOLVED_HOST="$resolved"
+    DIRECT_RESOLVED_SOURCE="vmware-tools"
+}
+
+direct_resolve_endpoint() {
+    local provider="$1" value="$2" endpoint_uri="$3" endpoint_mac="$4" endpoint_address="${5:-127.0.0.1}"
+    DIRECT_RESOLVED_HOST=""
+    DIRECT_RESOLVED_SOURCE=""
+    DIRECT_RESOLVE_ERROR=""
+    case "$provider" in
+        address)
+            DIRECT_RESOLVED_HOST="$value"; DIRECT_RESOLVED_SOURCE="configured" ;;
+        libvirt)
+            direct_resolve_libvirt "$value" "$endpoint_uri" "$endpoint_mac" ;;
+        libvirt-user)
+            DIRECT_RESOLVED_HOST="$endpoint_address"; DIRECT_RESOLVED_SOURCE="qemu-user-forward" ;;
+        vmware)
+            direct_resolve_vmware "$value" ;;
+        *)
+            DIRECT_RESOLVE_ERROR="unknown direct endpoint provider: $provider"; return 1 ;;
+    esac
+}
+
+direct_tcp_ready() {
+    python3 - "$1" "$2" <<'PY_TCP_READY' >/dev/null 2>&1
+import socket, sys
+with socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=0.4):
+    pass
+PY_TCP_READY
+}
+
+direct_wait_for_ready() {
+    local provider="$1" value="$2" port="$3" endpoint_uri="$4" endpoint_mac="$5" timeout="$6"
+    local endpoint_address="${7:-127.0.0.1}"
+    local deadline=$((SECONDS + timeout)) last_error=""
+    log "waiting up to ${timeout}s for direct RDP endpoint"
+    while (( SECONDS <= deadline )); do
+        if direct_resolve_endpoint "$provider" "$value" "$endpoint_uri" "$endpoint_mac" "$endpoint_address"; then
+            if direct_tcp_ready "$DIRECT_RESOLVED_HOST" "$port"; then return 0; fi
+            last_error="TCP ${DIRECT_RESOLVED_HOST}:$port is not accepting connections"
+        else
+            last_error="$DIRECT_RESOLVE_ERROR"
+        fi
+        sleep 1
+    done
+    die "direct RDP endpoint did not become ready within ${timeout}s: $last_error (the VM was left running)"
+}
+
+direct_wait_for_shutdown() {
+    local provider="$1" value="$2" uri="$3" state rc
+    [[ "$provider" != none && -n "$provider" ]] \
+        || die "--wait-for-shutdown requires a configured VM lifecycle provider"
+    log "RDP ended; waiting for $provider VM '$value' to shut off"
+    while true; do
+        if state="$(direct_lifecycle_state "$provider" "$value" "$uri")"; then
+            case "$state" in
+                'shut off'|shutoff|stopped)
+                    log "$provider VM '$value' is fully shut off"
+                    return 0 ;;
+            esac
+        else
+            rc=$?
+            (( rc == 127 )) && die "$([[ "$provider" == libvirt ]] && printf virsh || printf vmrun) is required for --wait-for-shutdown"
+            die "unable to query $provider lifecycle state for '$value' while waiting for shutdown"
+        fi
+        sleep 1
+    done
+}
+
+rdp_direct_control() {
+    [[ $# -eq 2 ]] || die "usage: ts rdp direct start|stop NAME"
+    local action="$1" name="$2" record ep ev port provider value options_b64
+    record="$(rdp_direct_record "$name" 2>/dev/null || true)"
+    [[ -n "$record" ]] || die "no direct RDP mapping for '$name'"
+    IFS='|' read -r _ ep ev port provider value options_b64 <<<"$record"
+    decode_direct_options "$options_b64"
+    [[ "$provider" != none && -n "$provider" ]] || die "direct RDP mapping '$name' has no lifecycle provider"
+    case "$provider:$action" in
+        libvirt:start)
+            have virsh || die "virsh is required for the configured lifecycle provider"
+            if [[ "$(direct_libvirt_state "$value" "$DIRECT_LIFECYCLE_URI" 2>/dev/null || true)" == running ]]; then
+                log "libvirt domain '$value' is already running"
+            else
+                local -a command
+                direct_virsh_base command "$DIRECT_LIFECYCLE_URI"
+                "${command[@]}" start "$value" >/dev/null || die "failed to start libvirt domain '$value'"
+                log "started libvirt domain '$value'"
+            fi ;;
+        libvirt:stop)
+            have virsh || die "virsh is required for the configured lifecycle provider"
+            local -a command
+            direct_virsh_base command "$DIRECT_LIFECYCLE_URI"
+            "${command[@]}" shutdown "$value" >/dev/null || die "failed to request shutdown for libvirt domain '$value'"
+            log "requested graceful shutdown of libvirt domain '$value'" ;;
+        vmware:start)
+            have vmrun || die "vmrun is required for the configured lifecycle provider"
+            if direct_vmware_running "$value"; then log "VMware VM '$value' is already running"; else
+                vmrun start "$value" nogui >/dev/null || die "failed to start VMware VM '$value'"
+                log "started VMware VM '$value'"
+            fi ;;
+        vmware:stop)
+            have vmrun || die "vmrun is required for the configured lifecycle provider"
+            vmrun stop "$value" soft >/dev/null || die "failed to request shutdown for VMware VM '$value'"
+            log "requested graceful shutdown of VMware VM '$value'" ;;
+        *) die "unsupported direct lifecycle operation: $provider $action" ;;
+    esac
+}
+
+rdp_direct_show() {
+    [[ $# -eq 1 ]] || die "usage: ts rdp direct show NAME"
+    local name="$1" record endpoint_provider endpoint_value port lifecycle_provider lifecycle_value options_b64 state
+    record="$(rdp_direct_record "$name" 2>/dev/null || true)"
+    [[ -n "$record" ]] || die "no direct RDP mapping for '$name'"
+    IFS='|' read -r _ endpoint_provider endpoint_value port lifecycle_provider lifecycle_value options_b64 <<<"$record"
+    decode_direct_options "$options_b64"
+    printf 'Name:          %s\n' "$name"
+    printf 'Endpoint:      %s\n' "$endpoint_provider"
+    printf 'Endpoint value: %s\n' "$endpoint_value"
+    printf 'Port:          %s\n' "${port:-3389}"
+    [[ -n "$DIRECT_ENDPOINT_URI" ]] && printf 'Endpoint URI:  %s\n' "$DIRECT_ENDPOINT_URI"
+    [[ -n "$DIRECT_ENDPOINT_MAC" ]] && printf 'Endpoint MAC:  %s\n' "$DIRECT_ENDPOINT_MAC"
+    if [[ "$endpoint_provider" == libvirt-user ]]; then
+        printf 'Host address:  %s\n' "$DIRECT_ENDPOINT_ADDRESS"
+        printf 'Guest port:    %s\n' "$DIRECT_ENDPOINT_GUEST_PORT"
+        printf 'QEMU netdev:   %s\n' "$DIRECT_ENDPOINT_NETDEV"
+    fi
+    printf 'Lifecycle:     %s%s\n' "${lifecycle_provider:-none}" "$([[ -n "$lifecycle_value" ]] && printf ' %s' "$lifecycle_value")"
+    printf 'Start policy:  %s\n' "$DIRECT_START_POLICY"
+    printf 'Boot timeout:  %ss\n' "$DIRECT_BOOT_TIMEOUT"
+    if [[ "$lifecycle_provider" != none && -n "$lifecycle_provider" ]]; then
+        if state="$(direct_lifecycle_state "$lifecycle_provider" "$lifecycle_value" "$DIRECT_LIFECYCLE_URI" 2>/dev/null)"; then
+            printf 'VM state:      %s\n' "$state"
+        else
+            printf 'VM state:      unavailable\n'
+        fi
+    fi
+    if direct_resolve_endpoint "$endpoint_provider" "$endpoint_value" "$DIRECT_ENDPOINT_URI" "$DIRECT_ENDPOINT_MAC" "$DIRECT_ENDPOINT_ADDRESS"; then
+        printf 'Resolved:      %s:%s (%s)\n' "$DIRECT_RESOLVED_HOST" "${port:-3389}" "$DIRECT_RESOLVED_SOURCE"
+    else
+        printf 'Resolved:      unavailable (%s)\n' "$DIRECT_RESOLVE_ERROR"
+    fi
+}
+
+rdp_direct_list() {
+    ensure_rdp_direct_config
+    if ! rdp_direct_has_mappings; then
+        printf 'No direct RDP mappings. Add one with: ts rdp direct set NAME --address HOST\n'
+        return 0
+    fi
+    printf '%-18s %-12s %-36s %-6s %-12s %-36s %s\n' NAME ENDPOINT VALUE PORT LIFECYCLE VALUE POLICY
+    local name ep ev port lp lv options_b64
+    while IFS='|' read -r name ep ev port lp lv options_b64; do
+        [[ -n "$name" && "$name" != \#* ]] || continue
+        decode_direct_options "$options_b64"
+        printf '%-18s %-12s %-36s %-6s %-12s %-36s %s\n' \
+            "$name" "$ep" "$ev" "${port:-3389}" "${lp:-none}" "${lv:--}" "$DIRECT_START_POLICY"
+    done < "$RDP_DIRECT_CONFIG"
+}
+
+rdp_direct_lifecycle_command() {
+    local action="${1:-show}"; shift || true
+    case "$action" in
+        set) rdp_direct_lifecycle_set "$@" ;;
+        rm|remove|clear) rdp_direct_lifecycle_remove "$@" ;;
+        show) rdp_direct_show "$@" ;;
+        help|-h|--help) rdp_usage ;;
+        *) die "unknown direct lifecycle command: $action" ;;
+    esac
+}
+
+rdp_direct_command() {
+    local action="${1:-list}"; shift || true
+    case "$action" in
+        set) rdp_direct_set "$@" ;;
+        show) rdp_direct_show "$@" ;;
+        list|ls) rdp_direct_list ;;
+        rm|remove|del|delete) rdp_direct_remove "$@" ;;
+        lifecycle) rdp_direct_lifecycle_command "$@" ;;
+        start|stop) rdp_direct_control "$action" "$@" ;;
+        help|-h|--help) rdp_usage ;;
+        *) die "unknown direct RDP command: $action" ;;
+    esac
+}
+
+rdp_credential_username() {
+    local name="$1" record username
+    record="$(rdp_record "$name" 2>/dev/null || true)"
+    [[ -n "$record" ]] || die "unknown RDP binding '$name'"
+    IFS='|' read -r _ _ _ username _ <<<"$record"
+    [[ -n "$username" ]] || die "RDP binding '$name' has no configured username"
+    printf '%s\n' "$username"
+}
+
+rdp_credential_lookup() {
+    local name="$1" secret
+    have secret-tool || return 1
+    secret="$(secret-tool lookup service "$RDP_SECRET_SERVICE" machine "$name" 2>/dev/null)" \
+        || return 1
+    [[ -n "$secret" ]] || return 1
+    printf '%s' "$secret"
+}
+
+rdp_credential_set() {
+    [[ $# -eq 1 ]] || die "usage: ts rdp credential set NAME"
+    have secret-tool || die "secret-tool is required (provided by libsecret)"
+    local name="$1" username password confirmation
+    username="$(rdp_credential_username "$name")"
+
+    printf 'Windows password for %s (%s): ' "$name" "$username" >&2
+    IFS= read -r -s password || die "unable to read password"
+    printf '\nRepeat password: ' >&2
+    IFS= read -r -s confirmation || die "unable to read password confirmation"
+    printf '\n' >&2
+    [[ -n "$password" ]] || die "password cannot be empty"
+    [[ "$password" == "$confirmation" ]] || die "passwords do not match"
+
+    if printf '%s' "$password" | secret-tool store \
+        --label="ts RDP: $name ($username)" \
+        service "$RDP_SECRET_SERVICE" machine "$name"; then
+        password="" confirmation=""
+        log "stored RDP credential for '$name' in the desktop keyring"
+    else
+        password="" confirmation=""
+        die "failed to store RDP credential for '$name' in the desktop keyring"
+    fi
+}
+
+rdp_credential_status() {
+    [[ $# -eq 1 ]] || die "usage: ts rdp credential status NAME"
+    local name="$1"
+    rdp_credential_username "$name" >/dev/null
+    have secret-tool || die "secret-tool is required (provided by libsecret)"
+    if rdp_credential_lookup "$name" >/dev/null; then
+        printf '%s: stored in desktop keyring\n' "$name"
+    else
+        printf '%s: not stored\n' "$name"
+        return 1
+    fi
+}
+
+rdp_credential_forget() {
+    [[ $# -eq 1 ]] || die "usage: ts rdp credential forget NAME"
+    local name="$1"
+    rdp_credential_username "$name" >/dev/null
+    have secret-tool || die "secret-tool is required (provided by libsecret)"
+    secret-tool clear service "$RDP_SECRET_SERVICE" machine "$name" >/dev/null \
+        || die "failed to remove RDP credential for '$name' from the desktop keyring"
+    log "removed RDP credential for '$name' from the desktop keyring"
+}
+
+rdp_credential_command() {
+    local action="${1:-status}"; shift || true
+    case "$action" in
+        set) rdp_credential_set "$@" ;;
+        status|show) rdp_credential_status "$@" ;;
+        forget|rm|remove|delete) rdp_credential_forget "$@" ;;
+        help|-h|--help) rdp_usage ;;
+        *) die "unknown RDP credential command: $action" ;;
+    esac
+}
+
+rdp_launch() {
+    [[ $# -ge 1 ]] || die "usage: ts rdp MACHINE [--direct] [--wait-for-shutdown] [--] [extra FreeRDP arguments...]"
+    local name="$1"; shift
+    local direct=0 wait_for_shutdown=0 saw_separator=0
+    local -a extra=()
+    while [[ $# -gt 0 ]]; do
+        if (( saw_separator )); then
+            extra+=("$1"); shift; continue
+        fi
+        case "$1" in
+            --direct) direct=1; shift ;;
+            --wait-for-shutdown) wait_for_shutdown=1; shift ;;
+            --) saw_separator=1; shift ;;
+            *) extra+=("$1"); shift ;;
+        esac
+    done
+    (( ! wait_for_shutdown || direct )) \
+        || die "--wait-for-shutdown is available only with --direct"
 
     local record target ip username port server_name args_b64
     record="$(rdp_record "$name" 2>/dev/null || true)"
@@ -700,19 +1580,45 @@ rdp_launch() {
     freerdp="$(find_freerdp || true)"
     [[ -n "$freerdp" ]] || die "FreeRDP client not found (expected xfreerdp3, xfreerdp, or wlfreerdp)"
 
-    rdp_start
+    local dial_host="$ip" dial_port=3389 route="Tailscale bridge"
+    if (( direct )); then
+        local direct_record endpoint_provider endpoint_value direct_port lifecycle_provider lifecycle_value options_b64
+        direct_record="$(rdp_direct_record "$name" 2>/dev/null || true)"
+        [[ -n "$direct_record" ]] || die "no direct RDP mapping for '$name'; configure one with: ts rdp direct set $name --address HOST"
+        IFS='|' read -r _ endpoint_provider endpoint_value direct_port lifecycle_provider lifecycle_value options_b64 <<<"$direct_record"
+        decode_direct_options "$options_b64"
+        if (( wait_for_shutdown )) && [[ "$lifecycle_provider" == none || -z "$lifecycle_provider" ]]; then
+            die "--wait-for-shutdown requires a configured VM lifecycle provider"
+        fi
+        direct_lifecycle_prepare "${lifecycle_provider:-none}" "$lifecycle_value" "$DIRECT_LIFECYCLE_URI" "$DIRECT_START_POLICY"
+        direct_prepare_endpoint "$endpoint_provider" "$endpoint_value" "${direct_port:-3389}" \
+            "$DIRECT_ENDPOINT_URI" "$DIRECT_ENDPOINT_ADDRESS" "$DIRECT_ENDPOINT_NETDEV" \
+            "$DIRECT_ENDPOINT_GUEST_PORT"
+        if [[ "$DIRECT_START_POLICY" == on-demand ]]; then
+            direct_wait_for_ready "$endpoint_provider" "$endpoint_value" "${direct_port:-3389}" \
+                "$DIRECT_ENDPOINT_URI" "$DIRECT_ENDPOINT_MAC" "$DIRECT_BOOT_TIMEOUT" "$DIRECT_ENDPOINT_ADDRESS"
+        else
+            direct_resolve_endpoint "$endpoint_provider" "$endpoint_value" "$DIRECT_ENDPOINT_URI" "$DIRECT_ENDPOINT_MAC" "$DIRECT_ENDPOINT_ADDRESS" \
+                || die "$DIRECT_RESOLVE_ERROR"
+        fi
+        dial_host="$DIRECT_RESOLVED_HOST"
+        dial_port="${direct_port:-3389}"
+        route="direct/$endpoint_provider ($DIRECT_RESOLVED_SOURCE)"
+    else
+        rdp_start
+    fi
 
-    local -a persistent=() extra=("$@") user_args=()
+    local -a persistent=() user_args=()
     [[ -n "$args_b64" ]] && mapfile -d '' -t persistent < <(decode_arg_vector_nul "$args_b64")
     user_args=("${persistent[@]}" "${extra[@]}")
 
-    local -a args=("/v:${ip}:3389" +clipboard /dynamic-resolution)
+    local -a args=("/v:${dial_host}:${dial_port}" +clipboard /dynamic-resolution)
     [[ -n "$username" ]] && args+=("/u:$username")
 
-    # The TCP connection terminates at a loopback binding, but TLS/NLA must
-    # validate the actual Windows host. User-supplied/persistent arguments are
+    # The TCP connection may terminate at a loopback bridge/direct endpoint,
+    # but TLS/NLA must validate the actual Windows host. User arguments are
     # examined first and then appended last, so they can override our defaults.
-    local help_text has_server_override=0 has_cert_policy=0 arg
+    local help_text has_server_override=0 has_cert_policy=0 has_auth_override=0 arg
     help_text="$("$freerdp" /help 2>&1 || true)"
     for arg in "${user_args[@]}"; do
         case "$arg" in
@@ -720,6 +1626,9 @@ rdp_launch() {
         esac
         case "$arg" in
             /cert:*|/cert-tofu|/cert-ignore|/cert-deny) has_cert_policy=1 ;;
+        esac
+        case "${arg,,}" in
+            /p:*|/password:*|/from-stdin*|/pth:*|/pass-the-hash:*) has_auth_override=1 ;;
         esac
     done
 
@@ -745,11 +1654,48 @@ rdp_launch() {
         fi
     fi
 
+    local stored_password=""
+    if (( ! has_auth_override )) && stored_password="$(rdp_credential_lookup "$name")"; then
+        grep -q '/from-stdin' <<<"$help_text" \
+            || die "stored RDP credentials require FreeRDP /from-stdin support"
+        args+=(/from-stdin:force)
+        log "using RDP credential for '$name' from the desktop keyring"
+    fi
+
     # Persistent per-machine options first, invocation-specific options last.
     # Example: ts rdp kubuntu -- -rfx /f
     args+=("${persistent[@]}" "${extra[@]}")
 
-    log "RDP $name -> $target:$port via $ip:3389 (server-name $server_name)"
+    log "RDP $name -> ${dial_host}:${dial_port} via $route (server-name $server_name)"
+    if (( wait_for_shutdown )); then
+        local freerdp_status
+        if [[ -n "$stored_password" ]]; then
+            if printf '%s\n' "$stored_password" | "$freerdp" "${args[@]}"; then
+                freerdp_status=0
+            else
+                freerdp_status=$?
+            fi
+            stored_password=""
+        else
+            if "$freerdp" "${args[@]}"; then
+                freerdp_status=0
+            else
+                freerdp_status=$?
+            fi
+        fi
+        direct_wait_for_shutdown "$lifecycle_provider" "$lifecycle_value" "$DIRECT_LIFECYCLE_URI"
+        return "$freerdp_status"
+    fi
+    if [[ -n "$stored_password" ]]; then
+        local freerdp_status
+        if printf '%s\n' "$stored_password" | "$freerdp" "${args[@]}"; then
+            freerdp_status=0
+        else
+            freerdp_status=$?
+        fi
+        stored_password=""
+        return "$freerdp_status"
+    fi
     exec "$freerdp" "${args[@]}"
 }
 rdp_command() {
@@ -759,6 +1705,8 @@ rdp_command() {
         add) rdp_add "$@" ;;
         rm|remove|del|delete) rdp_remove "$@" ;;
         args|options|opts) rdp_args "$@" ;;
+        credential|credentials|cred) rdp_credential_command "$@" ;;
+        direct) rdp_direct_command "$@" ;;
         list|ls) rdp_list ;;
         start) rdp_start ;;
         stop) rdp_stop ;;
@@ -775,10 +1723,31 @@ Usage:
   ts rdp add NAME ... [--rdp-arg ARG ...] [--clear-rdp-args]
   ts rdp args NAME [-- ARGS...]     Replace persistent per-machine FreeRDP arguments
   ts rdp args NAME --clear         Clear persistent arguments
+  ts rdp credential set NAME       Store the Windows password in the desktop keyring
+  ts rdp credential status NAME    Report whether a password is stored
+  ts rdp credential forget NAME    Remove the stored password
   ts rdp rm NAME
   ts rdp list
   ts rdp start|stop|restart|status
   ts rdp MACHINE [--] [extra FreeRDP args...]
+  ts rdp MACHINE --direct [--wait-for-shutdown] [--] [extra FreeRDP args...]
+
+Direct endpoint (explicit; never selected automatically):
+  ts rdp direct set NAME --address HOST [--port PORT]
+  ts rdp direct set NAME --libvirt-domain DOMAIN [--libvirt-uri URI] [--mac MAC] [--port PORT]
+  ts rdp direct set NAME --libvirt-user-domain DOMAIN [--libvirt-uri URI]
+      [--host-address ADDRESS] [--port HOST_PORT] [--guest-port PORT] [--netdev ID]
+  ts rdp direct set NAME --vmx /absolute/path/to/guest.vmx [--port PORT]
+  ts rdp direct show|rm NAME
+  ts rdp direct list
+
+Independent VM lifecycle:
+  ts rdp direct lifecycle set NAME --libvirt-domain DOMAIN [--libvirt-uri URI]
+      [--start-policy manual|on-demand] [--boot-timeout SECONDS]
+  ts rdp direct lifecycle set NAME --vmx /absolute/path/to/guest.vmx
+      [--start-policy manual|on-demand] [--boot-timeout SECONDS]
+  ts rdp direct lifecycle rm NAME
+  ts rdp direct start|stop NAME
 
 Defaults:
   TARGET       NAME (MagicDNS name is ideal)
@@ -797,7 +1766,12 @@ Examples:
   ts rdp add win-comsol --ip 127.77.0.20
   ts rdp add brazil 100.92.252.75 --server-name example-i9 --user 'AMAURI-I9\amauri'
   ts rdp args kubuntu -- -rfx
+  ts rdp credential set kubuntu
   ts rdp kubuntu
+  ts rdp direct set kubuntu --libvirt-user-domain win11 --libvirt-uri qemu:///system --port 13389
+  ts rdp direct lifecycle set kubuntu --libvirt-domain win11 --libvirt-uri qemu:///system --start-policy on-demand
+  ts rdp kubuntu --direct
+  ts rdp kubuntu --direct --wait-for-shutdown
   ts rdp kubuntu -- -rfx /f
   ts rdp win-pscad /f
 EOF_RDP
@@ -972,7 +1946,9 @@ PY
 # -----------------------------------------------------------------------------
 # SSH key / fleet configuration
 #
-# ssh-keys.tsv accepts pipe or tab separated records:
+# ssh-keys.tsv contains client LOGIN public keys copied to authorized_keys.
+# It never contains SSH server host keys; those belong in known_hosts.
+# Records accept pipe or tab separators:
 #   name | key_type | public_key | comment/source | targets
 # targets is '*', '-', or a comma-separated list of fleet host names. '-' means disabled/unscoped.
 # This is intentionally compatible with the earlier five-column notes file:
@@ -1060,10 +2036,10 @@ config_key_remove() {
 config_key_scope() {
     ensure_config_registry
     [[ $# -eq 2 ]] || die "usage: ts config key scope NAME HOST[,HOST...]|*|-"
-    local name="$1" targets="$2" rec key_type key_data comment old_targets tmp
+    local name="$1" targets="$2" rec key_type key_data comment tmp
     rec="$(config_key_record "$name" 2>/dev/null || true)"
     [[ -n "$rec" ]] || die "unknown SSH key: $name"
-    IFS=$'|\t' read -r _ key_type key_data comment old_targets <<< "$rec"
+    IFS=$'|\t' read -r _ key_type key_data comment _ <<< "$rec"
     [[ -n "$targets" ]] || targets="-"
     tmp="$(mktemp "${TMPDIR:-/tmp}/ts-keys.XXXXXX")"
     awk -F '[|\t]' -v n="$name" '$1 != n' "$SSH_KEYS_CONFIG" > "$tmp" || true
@@ -1217,8 +2193,64 @@ fleet_ssh_base() {
     return 0
 }
 
+validate_fleet_credentials() {
+    local path="$1" mode
+    [[ -f "$path" && -r "$path" ]] || die "credentials file is not readable: $path"
+    mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "unable to inspect credentials file permissions: $path"
+    (( (8#$mode & 077) == 0 )) || die "credentials file must not be accessible by group or others: chmod 600 $path"
+    awk -F '|' '
+        /^[[:space:]]*(#|$)/ {next}
+        NF != 2 || $1 !~ /^[A-Za-z0-9._-]+$/ || $2 == "" {bad=1}
+        END {exit bad}
+    ' "$path" || die "invalid credentials file; expected NAME|PASSWORD with no pipe or newline in the password"
+}
+
+fleet_password_for_host() {
+    local path="$1" wanted="$2" name password
+    validate_fleet_credentials "$path"
+    while IFS='|' read -r name password; do
+        [[ -n "$name" && "$name" != \#* ]] || continue
+        if [[ "$name" == "$wanted" ]]; then
+            printf '%s\n' "$password"
+            return 0
+        fi
+    done < "$path"
+    return 1
+}
+
+fleet_ssh_run_script() {
+    local host_name="$1" credentials="$2" script="$3"; shift 3
+    if [[ -z "$credentials" ]]; then
+        "$@" < "$script"
+        return
+    fi
+    fleet_password_for_host "$credentials" "$host_name" >/dev/null \
+        || die "credentials file has no password for fleet host '$host_name'"
+    TS_FLEET_ASKPASS_MODE=1 \
+    TS_FLEET_ASKPASS_FILE="$credentials" \
+    TS_FLEET_ASKPASS_HOST="$host_name" \
+    SSH_ASKPASS="$(self_path)" \
+    SSH_ASKPASS_REQUIRE=force \
+    DISPLAY="${DISPLAY:-ts-bootstrap}" \
+        "$@" < "$script"
+}
+
+powershell_encode_file() {
+    local path="$1"
+    have python3 || die "python3 is required for Windows fleet operations"
+    python3 - "$path" <<'PY_POWERSHELL_ENCODE'
+import base64
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text(encoding="utf-8")
+print(base64.b64encode(text.encode("utf-16le")).decode("ascii"))
+PY_POWERSHELL_ENCODE
+}
+
 config_push_linux() {
-    local host_name="$1" target="$2" user="$3" keys script
+    local host_name="$1" target="$2" user="$3" credentials="${4:-}" keys script
     keys="$(config_keys_for_host "$host_name")"
     [[ -n "$keys" ]] || die "no SSH keys are authorized for host '$host_name'"
     script="$(mktemp "${TMPDIR:-/tmp}/ts-push-linux.XXXXXX")"
@@ -1261,7 +2293,8 @@ EOS_LINUX
     local -a ssh_cmd
     fleet_ssh_base ssh_cmd
     log "pushing SSH authorization -> $host_name ($user@$target, linux)"
-    if "${ssh_cmd[@]}" -l "$user" "$target" 'bash -s' < "$script"; then
+    if fleet_ssh_run_script "$host_name" "$credentials" "$script" \
+        "${ssh_cmd[@]}" -l "$user" "$target" 'bash -s'; then
         rm -f "$script"
         return 0
     else
@@ -1272,7 +2305,7 @@ EOS_LINUX
 }
 
 config_push_windows() {
-    local host_name="$1" target="$2" user="$3" keys payload script
+    local host_name="$1" target="$2" user="$3" credentials="${4:-}" keys payload script encoded
     keys="$(config_keys_for_host "$host_name")"
     [[ -n "$keys" ]] || die "no SSH keys are authorized for host '$host_name'"
     payload="$(printf '%s\n' "$keys" | python3 -c 'import base64,sys; print(base64.b64encode(sys.stdin.buffer.read()).decode())')"
@@ -1310,10 +2343,13 @@ if ($isAdmin) {
 Write-Output "ts: authorized managed keys in $path"
 EOF_PS1
     } > "$script"
+    encoded="$(powershell_encode_file "$script")"
     local -a ssh_cmd
     fleet_ssh_base ssh_cmd
     log "pushing SSH authorization -> $host_name ($user@$target, windows)"
-    if "${ssh_cmd[@]}" -l "$user" "$target" 'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command -' < "$script"; then
+    if fleet_ssh_run_script "$host_name" "$credentials" /dev/null \
+        "${ssh_cmd[@]}" -l "$user" "$target" \
+        "powershell.exe -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand $encoded"; then
         rm -f "$script"
         return 0
     else
@@ -1324,15 +2360,134 @@ EOF_PS1
 }
 
 config_push_one() {
-    local name="$1" rec target user os
+    local name="$1" credentials="${2:-}" rec target user os
     rec="$(fleet_record "$name" 2>/dev/null || true)"
     [[ -n "$rec" ]] || die "unknown fleet host '$name'; add it with: ts config host add $name --user USER --os linux|windows"
     IFS='|' read -r _ target user os <<< "$rec"
     case "$os" in
-        linux) config_push_linux "$name" "$target" "$user" ;;
-        windows) config_push_windows "$name" "$target" "$user" ;;
+        linux) config_push_linux "$name" "$target" "$user" "$credentials" ;;
+        windows) config_push_windows "$name" "$target" "$user" "$credentials" ;;
         *) die "invalid OS '$os' for fleet host '$name'" ;;
     esac
+}
+
+config_bootstrap() {
+    [[ $# -ge 1 ]] || die "usage: ts config bootstrap HOST|--all [--credentials FILE]"
+    local selector="$1" credentials="$FLEET_CREDENTIALS" name rc=0; shift
+    local -a credential_hosts=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --credentials)
+                [[ $# -ge 2 ]] || die "--credentials requires a file"
+                credentials="$2"; shift 2 ;;
+            *) die "unknown bootstrap option: $1" ;;
+        esac
+    done
+    validate_fleet_credentials "$credentials"
+    if [[ "$selector" == --all || "$selector" == all ]]; then
+        mapfile -t credential_hosts < <(awk -F '|' '!/^[[:space:]]*(#|$)/ {print $1}' "$credentials")
+        (( ${#credential_hosts[@]} )) || die "credentials file has no host records"
+        for name in "${credential_hosts[@]}"; do
+            if config_push_one "$name" "$credentials"; then
+                log "bootstrap OK: $name"
+            else
+                log "bootstrap FAILED: $name"
+                rc=1
+            fi
+        done
+        return "$rc"
+    fi
+    config_push_one "$selector" "$credentials"
+    log "bootstrap OK: $selector"
+}
+
+config_enroll_one() {
+    local name="$1" hub="$2" rec target user os key_spec key_type key_data script encoded
+    rec="$(fleet_record "$name" 2>/dev/null || true)"
+    [[ -n "$rec" ]] || die "unknown fleet host '$name'"
+    IFS='|' read -r _ target user os <<< "$rec"
+
+    if [[ "$name" == "$hub" ]]; then
+        [[ -r "$HOME/.ssh/id_ed25519.pub" ]] \
+            || die "hub login public key is missing: $HOME/.ssh/id_ed25519.pub"
+        config_key_add "$name" "$(head -n 1 "$HOME/.ssh/id_ed25519.pub")" --on '*'
+        return 0
+    fi
+
+    script="$(mktemp "${TMPDIR:-/tmp}/ts-enroll.XXXXXX")"
+    local -a ssh_cmd
+    fleet_ssh_base ssh_cmd
+    case "$os" in
+        linux)
+            cat > "$script" <<'EOF_ENROLL_LINUX'
+set -eu
+name="$1"
+umask 077
+mkdir -p "$HOME/.ssh"
+chmod 700 "$HOME/.ssh"
+key="$HOME/.ssh/id_ed25519"
+if [ ! -f "$key" ]; then
+    ssh-keygen -q -t ed25519 -N '' -C "ts-login:$name" -f "$key"
+fi
+cat "$key.pub"
+EOF_ENROLL_LINUX
+            key_spec="$("${ssh_cmd[@]}" -o BatchMode=yes -l "$user" "$target" \
+                'bash -s -- '"$(printf '%q' "$name")" < "$script" | awk '/^(ssh-|ecdsa-|sk-)/ {print; exit}')" ;;
+        windows)
+            # The dollar sign is PowerShell syntax and must remain literal here.
+            # shellcheck disable=SC2016
+            printf '$fleetName = %s\n' "$(printf "'%s'" "$name")" > "$script"
+            cat >> "$script" <<'EOF_ENROLL_WINDOWS'
+$ErrorActionPreference = 'Stop'
+$dir = Join-Path $env:USERPROFILE '.ssh'
+New-Item -ItemType Directory -Force -Path $dir | Out-Null
+$key = Join-Path $dir 'id_ed25519'
+if (-not (Test-Path -LiteralPath $key)) {
+    & ssh-keygen.exe -q -t ed25519 -N '""' -C "ts-login:$fleetName" -f $key
+    if ($LASTEXITCODE -ne 0) { throw "ssh-keygen failed with exit code $LASTEXITCODE" }
+}
+Get-Content -LiteralPath ($key + '.pub')
+EOF_ENROLL_WINDOWS
+            encoded="$(powershell_encode_file "$script")"
+            key_spec="$("${ssh_cmd[@]}" -o BatchMode=yes -l "$user" "$target" \
+                "powershell.exe -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand $encoded" \
+                | tr -d '\r' | awk '/^(ssh-|ecdsa-|sk-)/ && !found {line=$0; found=1} END {if (found) print line}')" ;;
+        *) rm -f "$script"; die "invalid OS '$os' for fleet host '$name'" ;;
+    esac
+    rm -f "$script"
+    [[ -n "$key_spec" ]] || die "failed to create or read the login public key for '$name'"
+    read -r key_type key_data _ <<< "$key_spec"
+    key_spec="$key_type $key_data ts-login:$name"
+    config_key_add "$name" "$key_spec" --on "$hub"
+    log "enrolled login identity from $name for passwordless SSH back to $hub"
+}
+
+config_enroll() {
+    [[ $# -ge 1 ]] || die "usage: ts config enroll HOST|--all [--hub FLEET_NAME]"
+    local selector="$1" hub="amauri-zbook" name rc=0; shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hub) [[ $# -ge 2 ]] || die "--hub requires a fleet name"; hub="$2"; shift 2 ;;
+            *) die "unknown enroll option: $1" ;;
+        esac
+    done
+    fleet_record "$hub" >/dev/null 2>&1 || die "unknown hub fleet host '$hub'"
+    if [[ "$selector" == --all || "$selector" == all ]]; then
+        while IFS='|' read -r name _ <&3; do
+            [[ -n "$name" && "$name" != \#* ]] || continue
+            if config_enroll_one "$name" "$hub"; then
+                log "enroll OK: $name"
+            else
+                log "enroll FAILED: $name"
+                rc=1
+            fi
+        done 3< "$FLEET_CONFIG"
+    else
+        config_enroll_one "$selector" "$hub"
+    fi
+    write_managed_authorized_keys_local "$hub"
+    log "installed enrolled fleet login keys on local hub '$hub'"
+    return "$rc"
 }
 
 config_push() {
@@ -1341,7 +2496,7 @@ config_push() {
     local selector="$1" rc=0 name
     if [[ "$selector" == "--all" || "$selector" == "all" ]]; then
         local found=0
-        while IFS='|' read -r name _; do
+        while IFS='|' read -r name _ <&3; do
             [[ -n "$name" && "$name" != \#* ]] || continue
             found=1
             if config_push_one "$name"; then
@@ -1350,7 +2505,7 @@ config_push() {
                 log "push FAILED: $name"
                 rc=1
             fi
-        done < "$FLEET_CONFIG"
+        done 3< "$FLEET_CONFIG"
         (( found )) || die "fleet registry is empty"
         return "$rc"
     fi
@@ -1375,11 +2530,11 @@ config_check() {
     [[ $# -eq 1 ]] || die "usage: ts config check HOST|--all"
     local selector="$1" rc=0 name
     if [[ "$selector" == "--all" || "$selector" == "all" ]]; then
-        while IFS='|' read -r name _; do
+        while IFS='|' read -r name _ <&3; do
             [[ -n "$name" && "$name" != \#* ]] || continue
             printf '%-20s ' "$name"
             if config_check_one "$name" >/dev/null 2>&1; then printf 'OK\n'; else printf 'FAILED\n'; rc=1; fi
-        done < "$FLEET_CONFIG"
+        done 3< "$FLEET_CONFIG"
         return "$rc"
     fi
     config_check_one "$selector"
@@ -1402,11 +2557,21 @@ config_install() {
     [[ -d "$source_dir" ]] || die "config source directory does not exist: $source_dir"
     source_dir="$(cd "$source_dir" && pwd -P)"
 
+    # Direct mappings contain host-specific hypervisor identifiers and are
+    # deliberately excluded from portable fleet configuration.
+    local host_local_file
+    for host_local_file in rdp-direct.tsv ssh-direct.tsv credentials.tsv; do
+        [[ ! -f "$source_dir/$host_local_file" ]] \
+            || log "ignoring host-local $host_local_file from config source"
+    done
+
     mkdir -p "$CONFIG_HOME"
     chmod 700 "$CONFIG_HOME" 2>/dev/null || true
 
     local stage
     stage="$(mktemp -d "${TMPDIR:-/tmp}/ts-config-install.XXXXXX")"
+    # Expand the path now because stage is local to this function.
+    # shellcheck disable=SC2064
     trap "rm -rf -- $(printf '%q' "$stage")" EXIT
 
     # Merge/validate entirely in staging. The canonical files are untouched if
@@ -1641,7 +2806,7 @@ fleet = merge_fleet(fleet_paths)
 
 print(f"[ts] config source: {source_dir}", file=sys.stderr)
 print(f"[ts] merged RDP bindings: {len(rdp)}", file=sys.stderr)
-print(f"[ts] merged SSH public keys: {len(keys)}", file=sys.stderr)
+print(f"[ts] merged SSH login public keys: {len(keys)}", file=sys.stderr)
 print(f"[ts] merged fleet hosts: {len(fleet)}", file=sys.stderr)
 for label, paths in (("rdp", rdp_paths), ("ssh-keys", key_paths), ("fleet", fleet_paths)):
     if paths:
@@ -1667,7 +2832,7 @@ PY_CONFIG_INSTALL
     fi
 
     local was_rdp_running=0
-    rdp_bridge_running && was_rdp_running=1 || true
+    if rdp_bridge_running; then was_rdp_running=1; fi
 
     local stamp backup_dir suffix=0
     stamp="$(date '+%Y%m%dT%H%M%S')"
@@ -1708,7 +2873,10 @@ config_show() {
     ensure_config_registry
     printf 'config-home:      %s\n' "$CONFIG_HOME"
     printf 'rdp-registry:     %s\n' "$RDP_CONFIG"
-    printf 'ssh-key-registry: %s\n' "$SSH_KEYS_CONFIG"
+    printf 'rdp-direct-local: %s\n' "$RDP_DIRECT_CONFIG"
+    printf 'ssh-login-keys:   %s\n' "$SSH_KEYS_CONFIG"
+    printf 'ssh-direct-local: %s\n' "$SSH_DIRECT_CONFIG"
+    printf 'credentials:      %s%s\n' "$FLEET_CREDENTIALS" "$([[ -f "$FLEET_CREDENTIALS" ]] && printf ' (present)' || printf ' (absent)')"
     printf 'fleet-registry:   %s\n' "$FLEET_CONFIG"
     printf 'controller-key:   %s%s\n' "$FLEET_IDENTITY" "$([[ -f "$FLEET_IDENTITY" ]] && printf ' (present)' || printf ' (absent)')"
 }
@@ -1721,12 +2889,13 @@ Install / migrate:
   ts config install [--from DIR] [--dry-run]
       Merge repository, current, and known legacy registries into ~/.config/ts.
       Validation happens before changes; conflicts abort; existing files are backed up.
+      Host-local rdp-direct.tsv, ssh-direct.tsv, and credentials.tsv are never imported or overwritten.
 
 Registry:
   ts config path
   ts config show
 
-SSH public keys:
+SSH login public keys (copied to authorized_keys; never server host keys):
   ts config key add NAME 'ssh-ed25519 AAAA... comment' [--on HOST[,HOST...]]
   ts config key scope NAME HOST[,HOST...]|*|-
   ts config key add NAME @/path/to/key.pub [--on HOST[,HOST...]]
@@ -1743,6 +2912,10 @@ Controller / authorization:
   ts config apply [HOSTNAME]         Apply managed keys to this Linux user's authorized_keys
   ts config push HOST                Push applicable keys to one host over Tailscale + SSH
   ts config push --all               Push applicable keys to every fleet host
+  ts config bootstrap HOST|--all [--credentials FILE]
+                                      First push using passwords from a mode-0600 file
+  ts config enroll HOST|--all [--hub FLEET_NAME]
+                                      Create/read remote user login keys and authorize them on the hub
   ts config sync HOST|--all          Alias for push
   ts config check HOST|--all         Test passwordless controller SSH
 
@@ -1781,6 +2954,8 @@ config_command() {
         apply)
             write_managed_authorized_keys_local "${1:-$(hostname -s)}" ;;
         push|sync) config_push "$@" ;;
+        bootstrap) config_bootstrap "$@" ;;
+        enroll) config_enroll "$@" ;;
         check) config_check "$@" ;;
         help|-h|--help) config_usage ;;
         *) die "unknown config command: $sub" ;;
@@ -1788,16 +2963,175 @@ config_command() {
 }
 
 # -----------------------------------------------------------------------------
-# Convenience accessors
+# Direct SSH registry and convenience accessors
 # -----------------------------------------------------------------------------
 
+ensure_ssh_direct_config() {
+    mkdir -p "$CONFIG_HOME"
+    touch "$SSH_DIRECT_CONFIG"
+    chmod 600 "$SSH_DIRECT_CONFIG" 2>/dev/null || true
+}
+
+ssh_direct_record() {
+    local name="$1"
+    [[ -f "$SSH_DIRECT_CONFIG" ]] || return 1
+    awk -F '|' -v n="$name" '$1 == n {print; found=1; exit} END {if (!found) exit 1}' "$SSH_DIRECT_CONFIG"
+}
+
+ssh_direct_set() {
+    [[ $# -ge 1 ]] || die "usage: ts ssh direct set NAME --libvirt-user-domain DOMAIN [OPTIONS]"
+    local name="$1" domain="" uri="" host="127.0.0.1" host_port="10022"
+    local guest_port="22" netdev="hostnet0" policy="on-demand" timeout="180" tmp sorted; shift
+    validate_config_name "$name"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --libvirt-user-domain) [[ $# -ge 2 ]] || die "$1 requires a value"; domain="$2"; shift 2 ;;
+            --libvirt-uri) [[ $# -ge 2 ]] || die "$1 requires a value"; uri="$2"; shift 2 ;;
+            --host-address) [[ $# -ge 2 ]] || die "$1 requires a value"; host="$2"; shift 2 ;;
+            --port) [[ $# -ge 2 ]] || die "$1 requires a value"; host_port="$2"; shift 2 ;;
+            --guest-port) [[ $# -ge 2 ]] || die "$1 requires a value"; guest_port="$2"; shift 2 ;;
+            --netdev) [[ $# -ge 2 ]] || die "$1 requires a value"; netdev="$2"; shift 2 ;;
+            --start-policy) [[ $# -ge 2 ]] || die "$1 requires a value"; policy="$2"; shift 2 ;;
+            --boot-timeout) [[ $# -ge 2 ]] || die "$1 requires a value"; timeout="$2"; shift 2 ;;
+            *) die "unknown direct SSH option: $1" ;;
+        esac
+    done
+    [[ -n "$domain" && "$domain" != -* ]] || die "--libvirt-user-domain is required"
+    validate_direct_host "$host"
+    validate_port "$host_port"
+    validate_port "$guest_port"
+    validate_boot_timeout "$timeout"
+    case "$policy" in manual|on-demand) ;; *) die "start policy must be manual or on-demand" ;; esac
+    [[ -n "$netdev" && "$netdev" != -* && "$netdev" =~ ^[A-Za-z0-9._-]+$ ]] \
+        || die "invalid QEMU user-network netdev: $netdev"
+    for value in "$domain" "$uri" "$host" "$netdev"; do validate_registry_field "direct SSH value" "$value"; done
+    ensure_ssh_direct_config
+    tmp="$(mktemp "$CONFIG_HOME/.ssh-direct.XXXXXX")"
+    sorted="$(mktemp "$CONFIG_HOME/.ssh-direct-sort.XXXXXX")"
+    awk -F '|' -v n="$name" '$1 != n' "$SSH_DIRECT_CONFIG" > "$tmp" || true
+    printf '%s|libvirt-user|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+        "$name" "$domain" "$host" "$host_port" "$guest_port" "$netdev" "$uri" "$policy" "$timeout" >> "$tmp"
+    sort -t '|' -k1,1 "$tmp" > "$sorted"
+    mv "$sorted" "$SSH_DIRECT_CONFIG"
+    rm -f "$tmp"
+    chmod 600 "$SSH_DIRECT_CONFIG" 2>/dev/null || true
+    log "direct SSH '$name': $host:$host_port -> $domain:$guest_port ($policy)"
+}
+
+ssh_direct_remove() {
+    [[ $# -eq 1 ]] || die "usage: ts ssh direct rm NAME"
+    local name="$1" tmp
+    ssh_direct_record "$name" >/dev/null 2>&1 || die "no direct SSH mapping for '$name'"
+    ensure_ssh_direct_config
+    tmp="$(mktemp "$CONFIG_HOME/.ssh-direct.XXXXXX")"
+    awk -F '|' -v n="$name" '$1 != n' "$SSH_DIRECT_CONFIG" > "$tmp" || true
+    mv "$tmp" "$SSH_DIRECT_CONFIG"
+    chmod 600 "$SSH_DIRECT_CONFIG" 2>/dev/null || true
+    log "removed direct SSH mapping: $name"
+}
+
+ssh_direct_list() {
+    ensure_ssh_direct_config
+    printf '%-20s %-16s %-18s %-21s %-10s %s\n' NAME PROVIDER DOMAIN ENDPOINT POLICY URI
+    local name provider domain host host_port guest_port netdev uri policy timeout
+    while IFS='|' read -r name provider domain host host_port guest_port netdev uri policy timeout; do
+        [[ -n "$name" && "$name" != \#* ]] || continue
+        printf '%-20s %-16s %-18s %-21s %-10s %s\n' \
+            "$name" "$provider" "$domain" "$host:$host_port->$guest_port" "$policy" "${uri:--}"
+    done < "$SSH_DIRECT_CONFIG"
+}
+
+ssh_direct_show() {
+    [[ $# -eq 1 ]] || die "usage: ts ssh direct show NAME"
+    local record name="$1" provider domain host host_port guest_port netdev uri policy timeout state
+    record="$(ssh_direct_record "$name" 2>/dev/null || true)"
+    [[ -n "$record" ]] || die "no direct SSH mapping for '$name'"
+    IFS='|' read -r _ provider domain host host_port guest_port netdev uri policy timeout <<< "$record"
+    state="$(direct_libvirt_state "$domain" "$uri" 2>/dev/null || printf unavailable)"
+    printf 'Name:          %s\nProvider:      %s\nDomain:        %s\nEndpoint:      %s:%s\nGuest port:    %s\nQEMU netdev:   %s\nLibvirt URI:   %s\nStart policy:  %s\nBoot timeout:  %ss\nVM state:      %s\n' \
+        "$name" "$provider" "$domain" "$host" "$host_port" "$guest_port" "$netdev" "${uri:--}" "$policy" "$timeout" "$state"
+}
+
+ssh_direct_command() {
+    local action="${1:-list}"; shift || true
+    case "$action" in
+        set) ssh_direct_set "$@" ;;
+        rm|remove|del|delete) ssh_direct_remove "$@" ;;
+        show) ssh_direct_show "$@" ;;
+        list|ls) ssh_direct_list ;;
+        help|-h|--help) ssh_usage ;;
+        *) die "unknown direct SSH command: $action" ;;
+    esac
+}
+
+ssh_direct_wait_ready() {
+    local host="$1" port="$2" timeout="$3"
+    local deadline=$((SECONDS + timeout))
+    log "waiting up to ${timeout}s for direct SSH endpoint $host:$port"
+    while (( SECONDS <= deadline )); do
+        direct_tcp_ready "$host" "$port" && return 0
+        sleep 1
+    done
+    die "direct SSH endpoint $host:$port did not become ready within ${timeout}s (the VM was left running)"
+}
+
+ssh_direct_launch() {
+    [[ $# -ge 1 ]] || die "usage: ts ssh --direct NAME [SSH_OPTIONS] [-- REMOTE_COMMAND...]"
+    local name="$1" record provider domain host host_port guest_port netdev uri policy timeout
+    local fleet target user os saw_separator=0; shift
+    local -a ssh_options=() remote_command=()
+    while [[ $# -gt 0 ]]; do
+        if (( saw_separator )); then remote_command+=("$1"); else
+            case "$1" in --) saw_separator=1 ;; *) ssh_options+=("$1") ;; esac
+        fi
+        shift
+    done
+    record="$(ssh_direct_record "$name" 2>/dev/null || true)"
+    [[ -n "$record" ]] || die "no direct SSH mapping for '$name'"
+    IFS='|' read -r _ provider domain host host_port guest_port netdev uri policy timeout <<< "$record"
+    [[ "$provider" == libvirt-user ]] || die "unsupported direct SSH provider: $provider"
+    fleet="$(fleet_record "$name" 2>/dev/null || true)"
+    [[ -n "$fleet" ]] || die "unknown fleet host '$name'"
+    IFS='|' read -r _ target user os <<< "$fleet"
+    direct_lifecycle_prepare libvirt "$domain" "$uri" "$policy"
+    direct_prepare_libvirt_user "$domain" "$uri" "$host" "$host_port" "$guest_port" "$netdev"
+    ssh_direct_wait_ready "$host" "$host_port" "$timeout"
+    log "SSH $name -> $host:$host_port via direct/libvirt-user (user $user)"
+    exec ssh -o "HostKeyAlias=$target" -o StrictHostKeyChecking=accept-new -p "$host_port" \
+        "${ssh_options[@]}" "$user@$host" "${remote_command[@]}"
+}
+
 ts_ssh() {
-    [[ $# -ge 1 ]] || die "usage: ts ssh [ssh arguments...] destination"
+    [[ $# -ge 1 ]] || die "usage: ts ssh [ssh arguments...] destination | ts ssh --direct NAME"
     have ssh || die "ssh client not found"
+    if [[ "$1" == help || "$1" == -h || "$1" == --help ]]; then ssh_usage; return; fi
+    if [[ "$1" == direct ]]; then ssh_direct_command "${@:2}"; return; fi
+    if [[ "$1" == --direct ]]; then ssh_direct_launch "${@:2}"; return; fi
+    if [[ $# -ge 2 && "$2" == --direct ]]; then
+        local direct_name="$1"; shift 2
+        ssh_direct_launch "$direct_name" "$@"
+        return
+    fi
     ensure_daemon
     local proxy_cmd
     printf -v proxy_cmd '%q --socket=%q nc %%h %%p' "$TAILSCALE" "$SOCKET"
     exec ssh -o "ProxyCommand=$proxy_cmd" "$@"
+}
+
+ssh_usage() {
+    cat <<'EOF_SSH'
+Usage:
+  ts ssh [OPENSSH_ARGS...] USER@HOST
+  ts ssh --direct NAME [SSH_OPTIONS...] [-- REMOTE_COMMAND...]
+  ts ssh NAME --direct [SSH_OPTIONS...] [-- REMOTE_COMMAND...]
+
+Direct QEMU user-network endpoint:
+  ts ssh direct set NAME --libvirt-user-domain DOMAIN [--libvirt-uri URI]
+      [--host-address ADDRESS] [--port HOST_PORT] [--guest-port PORT]
+      [--netdev ID] [--start-policy manual|on-demand] [--boot-timeout SECONDS]
+  ts ssh direct show|rm NAME
+  ts ssh direct list
+EOF_SSH
 }
 
 show_status() {
@@ -1821,6 +3155,7 @@ show_status() {
     else
         printf 'RDP bindings: none\n'
     fi
+    printf 'Direct maps:   %s (host-local)\n' "$(rdp_direct_count)"
 }
 
 start_all() {
@@ -1877,6 +3212,20 @@ doctor() {
 
     if have python3; then printf '%-22s %s\n' python3 OK; else printf '%-22s %s\n' python3 MISSING; rc=1; fi
     if find_freerdp >/dev/null 2>&1; then printf '%-22s %s\n' FreeRDP "$(basename "$(find_freerdp)")"; else printf '%-22s %s\n' FreeRDP MISSING; fi
+    if have secret-tool; then printf '%-22s %s\n' RDP-keyring available; else printf '%-22s %s\n' RDP-keyring unavailable; fi
+    if have virsh; then
+        printf '%-22s %s\n' virsh available
+        if virsh uri >/dev/null 2>&1; then
+            printf '%-22s %s\n' libvirt-connection available
+        else
+            printf '%-22s %s\n' libvirt-connection unavailable
+        fi
+    else
+        printf '%-22s %s\n' virsh unavailable
+        printf '%-22s %s\n' libvirt-connection unavailable
+    fi
+    if have vmrun; then printf '%-22s %s\n' vmrun available; else printf '%-22s %s\n' vmrun unavailable; fi
+    printf '%-22s %s\n' direct-rdp-mappings "$(rdp_direct_count)"
 
     if rdp_has_bindings; then
         printf '%-22s %s\n' rdp-bindings "$(grep -cEv '^[[:space:]]*(#|$)' "$RDP_CONFIG")"
@@ -1911,6 +3260,7 @@ Core:
   ts netcheck               Native Tailscale netcheck (passthrough)
   ts nc HOST PORT           Native Tailscale netcat (passthrough)
   ts ssh [ARGS] DEST        OpenSSH through 'tailscale nc' as ProxyCommand
+  ts ssh NAME --direct      Lazy direct SSH to a locally managed VM
   ts config ...             Fleet/key registry and authorization propagation
   ts config install [--from DIR]  Merge/migrate repo config into ~/.config/ts
   ts proxy-env              Print proxy environment exports
@@ -1922,13 +3272,26 @@ RDP:
   ts rdp list
   ts rdp start|stop|restart|status
   ts rdp args NAME [-- ARGS...]   Persist per-machine FreeRDP options
+  ts rdp credential set NAME      Save its Windows password in the desktop keyring
+  ts rdp credential status NAME   Check whether a password is stored
+  ts rdp credential forget NAME   Remove its stored password
   ts rdp MACHINE [--] [extra FreeRDP args...]
+  ts rdp MACHINE --direct [--wait-for-shutdown] [--] [extra FreeRDP args...]
+  ts rdp direct set NAME --address HOST [--port PORT]
+  ts rdp direct set NAME --libvirt-domain DOMAIN [--libvirt-uri URI] [--mac MAC]
+  ts rdp direct set NAME --libvirt-user-domain DOMAIN [--libvirt-uri URI] [--port HOST_PORT]
+  ts rdp direct set NAME --vmx /absolute/path/to/guest.vmx
+  ts rdp direct lifecycle set NAME --libvirt-domain DOMAIN --start-policy manual|on-demand
+  ts rdp direct show|rm|start|stop NAME
+  ts rdp direct list
 
 Fleet configuration:
   ts config controller init [NAME]
   ts config key add NAME PUBLIC_KEY [--on HOST[,HOST...]]
   ts config host add NAME [TARGET] --user USER --os linux|windows
   ts config push HOST|--all
+  ts config bootstrap HOST|--all --credentials FILE
+  ts config enroll HOST|--all --hub FLEET_NAME
   ts config check HOST|--all
   ts config help
 
@@ -1950,7 +3313,11 @@ Environment:
   TAILSCALE_USER_PROXY_ADDR  userspace SOCKS5/HTTP listener (default: 127.0.0.1:1055)
   TAILSCALE_AUTHKEY          optional auth key for setup/up
   TS_RDP_CONFIG              alternate RDP registry path
-  TS_SSH_KEYS_CONFIG         alternate SSH public-key registry path
+  TS_RDP_DIRECT_CONFIG       alternate host-local direct RDP registry path
+  TS_RDP_SECRET_SERVICE      desktop-keyring service name (default: tailscale-fleet-rdp)
+  TS_SSH_KEYS_CONFIG         alternate SSH login-public-key registry path
+  TS_SSH_DIRECT_CONFIG       alternate host-local direct SSH registry path
+  TS_FLEET_CREDENTIALS       bootstrap password file (default: ~/.config/ts/credentials.tsv)
   TS_FLEET_CONFIG            alternate fleet host registry path
   TS_FLEET_IDENTITY          controller private key (default: ~/.ssh/ts-fleet-ed25519)
 EOF_USAGE
@@ -2037,4 +3404,12 @@ main() {
     esac
 }
 
-main "$@"
+if [[ "${TS_FLEET_ASKPASS_MODE:-0}" == 1 ]]; then
+    fleet_password_for_host "${TS_FLEET_ASKPASS_FILE:?}" "${TS_FLEET_ASKPASS_HOST:?}" \
+        || exit 1
+    exit 0
+fi
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

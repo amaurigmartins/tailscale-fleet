@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -eu
+
+: "${MOCK_VIRSH_STATE:?}"
+: "${MOCK_VIRSH_LOG:?}"
+printf '%s\n' "$*" >> "$MOCK_VIRSH_LOG"
+
+if [[ "${1:-}" == --connect ]]; then
+    printf 'uri=%s\n' "$2" >> "$MOCK_VIRSH_LOG"
+    shift 2
+fi
+
+command="${1:-}"
+shift || true
+case "$command" in
+    uri)
+        printf 'qemu:///session\n'
+        ;;
+    domstate)
+        sed -n '1p' "$MOCK_VIRSH_STATE"
+        ;;
+    start)
+        printf 'running\n' > "$MOCK_VIRSH_STATE"
+        printf "Domain '%s' started\n" "${1:-}"
+        ;;
+    shutdown)
+        printf 'shut off\n' > "$MOCK_VIRSH_STATE"
+        printf "Domain '%s' is being shutdown\n" "${1:-}"
+        ;;
+    domiflist)
+        sed -n '1,$p' "${MOCK_VIRSH_DOMIFLIST:?}"
+        ;;
+    domifaddr)
+        source_name=""
+        while [[ $# -gt 0 ]]; do
+            case "$1" in
+                --source) source_name="$2"; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        file="${MOCK_VIRSH_ADDR_DIR:?}/${source_name}"
+        [[ -f "$file" ]] && sed -n '1,$p' "$file"
+        ;;
+    qemu-monitor-command)
+        : "${MOCK_VIRSH_USERNET:?}"
+        domain="${1:-}"
+        [[ -n "$domain" && "${2:-}" == --hmp ]] || exit 2
+        hmp="${3:-}"
+        case "$hmp" in
+            'info usernet')
+                sed -n '1,$p' "$MOCK_VIRSH_USERNET"
+                ;;
+            hostfwd_add\ *)
+                spec="${hmp#hostfwd_add }"
+                spec="${spec#* }"
+                if [[ "$spec" =~ ^tcp:([^:]+):([0-9]+)-:([0-9]+)$ ]]; then
+                    printf 'TCP[HOST_FORWARD]  99  %s %s 10.0.2.15 %s 0 0\n' \
+                        "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" >> "$MOCK_VIRSH_USERNET"
+                else
+                    printf 'invalid hostfwd_add: %s\n' "$hmp" >&2
+                    exit 2
+                fi
+                ;;
+            *)
+                printf 'unexpected HMP command: %s\n' "$hmp" >&2
+                exit 2
+                ;;
+        esac
+        ;;
+    *)
+        printf 'unexpected virsh command: %s\n' "$command" >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -eu
+
+if [[ "${1:-}" == /help ]]; then
+    printf '%s\n' '/server-name:hostname' '/cert:tofu' '/from-stdin[:force]'
+    exit 0
+fi
+
+: "${MOCK_FREERDP_LOG:?}"
+printf '%s\n' "$@" > "$MOCK_FREERDP_LOG"
+if [[ " $* " == *' /from-stdin:force '* ]]; then
+    : "${MOCK_FREERDP_STDIN_LOG:?}"
+    cat > "$MOCK_FREERDP_STDIN_LOG"
+fi
+if [[ -n "${MOCK_FREERDP_SHUTDOWN_STATE:-}" ]]; then
+    printf 'shut off\n' > "$MOCK_FREERDP_SHUTDOWN_STATE"
+fi

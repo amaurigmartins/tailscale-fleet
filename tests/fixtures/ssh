@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -eu
+
+: "${MOCK_SSH_LOG:?}"
+printf '%s\n' "$@" > "$MOCK_SSH_LOG"

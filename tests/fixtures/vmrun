@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+set -eu
+
+: "${MOCK_VMRUN_STATE:?}"
+: "${MOCK_VMRUN_VMX:?}"
+: "${MOCK_VMRUN_LOG:?}"
+printf '%s\n' "$*" >> "$MOCK_VMRUN_LOG"
+
+command="${1:-}"
+shift || true
+case "$command" in
+    list)
+        if [[ "$(sed -n '1p' "$MOCK_VMRUN_STATE")" == running ]]; then
+            printf 'Total running VMs: 1\n%s\n' "$MOCK_VMRUN_VMX"
+        else
+            printf 'Total running VMs: 0\n'
+        fi
+        ;;
+    start)
+        [[ "${1:-}" == "$MOCK_VMRUN_VMX" ]]
+        printf 'running\n' > "$MOCK_VMRUN_STATE"
+        ;;
+    stop)
+        [[ "${1:-}" == "$MOCK_VMRUN_VMX" ]]
+        printf 'shut off\n' > "$MOCK_VMRUN_STATE"
+        ;;
+    getGuestIPAddress)
+        [[ "${1:-}" == "$MOCK_VMRUN_VMX" ]]
+        printf '%s\n' "${MOCK_VMWARE_IP:?}"
+        ;;
+    *)
+        printf 'unexpected vmrun command: %s\n' "$command" >&2
+        exit 2
+        ;;
+esac
