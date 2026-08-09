@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 TS_NAME="ts"
-TS_VERSION="4.3.0"
+TS_VERSION="4.4.0"
 DAEMON_APP="tailscale-user"   # Preserve compatibility with the earlier installer/state.
 
 BASE="${TAILSCALE_USER_HOME:-$HOME/.local/share/$DAEMON_APP}"
@@ -30,6 +30,7 @@ FLEET_CONFIG="${TS_FLEET_CONFIG:-$CONFIG_HOME/fleet.tsv}"
 FLEET_CREDENTIALS="${TS_FLEET_CREDENTIALS:-$CONFIG_HOME/credentials.tsv}"
 FLEET_IDENTITY="${TS_FLEET_IDENTITY:-$HOME/.ssh/ts-fleet-ed25519}"
 RDP_SECRET_SERVICE="${TS_RDP_SECRET_SERVICE:-tailscale-fleet-rdp}"
+CONFIG_BACKUP_KEEP="${TS_CONFIG_BACKUP_KEEP:-5}"
 RDP_STATE="$BASE/rdp"
 RDP_LOG="$RDP_STATE/bridge.log"
 RDP_PID="$RDP_STATE/bridge.pid"
@@ -1475,17 +1476,26 @@ rdp_direct_command() {
 }
 
 rdp_credential_username() {
-    local name="$1" record username
+    local name="$1" override="${2:-}" record username
     record="$(rdp_record "$name" 2>/dev/null || true)"
     [[ -n "$record" ]] || die "unknown RDP binding '$name'"
     IFS='|' read -r _ _ _ username _ <<<"$record"
+    if [[ -n "$override" ]]; then username="$override"; fi
     [[ -n "$username" ]] || die "RDP binding '$name' has no configured username"
     printf '%s\n' "$username"
 }
 
 rdp_credential_lookup() {
-    local name="$1" secret
+    local name="$1" username="$2" default_username secret
     have secret-tool || return 1
+    if secret="$(secret-tool lookup service "$RDP_SECRET_SERVICE" machine "$name" username "$username" 2>/dev/null)" \
+        && [[ -n "$secret" ]]; then
+        printf '%s' "$secret"
+        return
+    fi
+    # Read the pre-4.4 machine-only entry for the binding's default user.
+    default_username="$(rdp_credential_username "$name")"
+    [[ "$username" == "$default_username" ]] || return 1
     secret="$(secret-tool lookup service "$RDP_SECRET_SERVICE" machine "$name" 2>/dev/null)" \
         || return 1
     [[ -n "$secret" ]] || return 1
@@ -1493,10 +1503,16 @@ rdp_credential_lookup() {
 }
 
 rdp_credential_set() {
-    [[ $# -eq 1 ]] || die "usage: ts rdp credential set NAME"
+    [[ $# -ge 1 ]] || die "usage: ts rdp credential set NAME [--user USER]"
     have secret-tool || die "secret-tool is required (provided by libsecret)"
-    local name="$1" username password confirmation
-    username="$(rdp_credential_username "$name")"
+    local name="$1" username="" password confirmation; shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user) [[ $# -ge 2 ]] || die "--user requires a value"; username="$2"; shift 2 ;;
+            *) die "unknown RDP credential set option: $1" ;;
+        esac
+    done
+    username="$(rdp_credential_username "$name" "$username")"
 
     printf 'Windows password for %s (%s): ' "$name" "$username" >&2
     IFS= read -r -s password || die "unable to read password"
@@ -1508,9 +1524,9 @@ rdp_credential_set() {
 
     if printf '%s' "$password" | secret-tool store \
         --label="ts RDP: $name ($username)" \
-        service "$RDP_SECRET_SERVICE" machine "$name"; then
+        service "$RDP_SECRET_SERVICE" machine "$name" username "$username"; then
         password="" confirmation=""
-        log "stored RDP credential for '$name' in the desktop keyring"
+        log "stored RDP credential for '$name' user '$username' in the desktop keyring"
     else
         password="" confirmation=""
         die "failed to store RDP credential for '$name' in the desktop keyring"
@@ -1518,26 +1534,45 @@ rdp_credential_set() {
 }
 
 rdp_credential_status() {
-    [[ $# -eq 1 ]] || die "usage: ts rdp credential status NAME"
-    local name="$1"
-    rdp_credential_username "$name" >/dev/null
+    [[ $# -ge 1 ]] || die "usage: ts rdp credential status NAME [--user USER]"
+    local name="$1" username=""; shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user) [[ $# -ge 2 ]] || die "--user requires a value"; username="$2"; shift 2 ;;
+            *) die "unknown RDP credential status option: $1" ;;
+        esac
+    done
+    username="$(rdp_credential_username "$name" "$username")"
     have secret-tool || die "secret-tool is required (provided by libsecret)"
-    if rdp_credential_lookup "$name" >/dev/null; then
-        printf '%s: stored in desktop keyring\n' "$name"
+    if rdp_credential_lookup "$name" "$username" >/dev/null; then
+        printf '%s [%s]: stored in desktop keyring\n' "$name" "$username"
     else
-        printf '%s: not stored\n' "$name"
+        printf '%s [%s]: not stored\n' "$name" "$username"
         return 1
     fi
 }
 
 rdp_credential_forget() {
-    [[ $# -eq 1 ]] || die "usage: ts rdp credential forget NAME"
-    local name="$1"
-    rdp_credential_username "$name" >/dev/null
+    [[ $# -ge 1 ]] || die "usage: ts rdp credential forget NAME [--user USER]"
+    local name="$1" username="" default_username; shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --user) [[ $# -ge 2 ]] || die "--user requires a value"; username="$2"; shift 2 ;;
+            *) die "unknown RDP credential forget option: $1" ;;
+        esac
+    done
+    username="$(rdp_credential_username "$name" "$username")"
     have secret-tool || die "secret-tool is required (provided by libsecret)"
-    secret-tool clear service "$RDP_SECRET_SERVICE" machine "$name" >/dev/null \
-        || die "failed to remove RDP credential for '$name' from the desktop keyring"
-    log "removed RDP credential for '$name' from the desktop keyring"
+    default_username="$(rdp_credential_username "$name")"
+    if ! secret-tool clear service "$RDP_SECRET_SERVICE" machine "$name" username "$username" >/dev/null; then
+        if [[ "$username" != "$default_username" ]] \
+            || ! secret-tool clear service "$RDP_SECRET_SERVICE" machine "$name" >/dev/null; then
+            die "failed to remove RDP credential for '$name' user '$username' from the desktop keyring"
+        fi
+    elif [[ "$username" == "$default_username" ]]; then
+        secret-tool clear service "$RDP_SECRET_SERVICE" machine "$name" >/dev/null 2>&1 || true
+    fi
+    log "removed RDP credential for '$name' user '$username' from the desktop keyring"
 }
 
 rdp_credential_command() {
@@ -1552,9 +1587,9 @@ rdp_credential_command() {
 }
 
 rdp_launch() {
-    [[ $# -ge 1 ]] || die "usage: ts rdp MACHINE [--direct] [--wait-for-shutdown] [--] [extra FreeRDP arguments...]"
+    [[ $# -ge 1 ]] || die "usage: ts rdp MACHINE [--user USER] [--direct] [--wait-for-shutdown] [--] [extra FreeRDP arguments...]"
     local name="$1"; shift
-    local direct=0 wait_for_shutdown=0 saw_separator=0
+    local direct=0 wait_for_shutdown=0 saw_separator=0 selected_user=""
     local -a extra=()
     while [[ $# -gt 0 ]]; do
         if (( saw_separator )); then
@@ -1563,6 +1598,7 @@ rdp_launch() {
         case "$1" in
             --direct) direct=1; shift ;;
             --wait-for-shutdown) wait_for_shutdown=1; shift ;;
+            --user) [[ $# -ge 2 ]] || die "--user requires a value"; selected_user="$2"; shift 2 ;;
             --) saw_separator=1; shift ;;
             *) extra+=("$1"); shift ;;
         esac
@@ -1574,6 +1610,8 @@ rdp_launch() {
     record="$(rdp_record "$name" 2>/dev/null || true)"
     [[ -n "$record" ]] || die "unknown RDP binding '$name'; add it with: ts rdp add $name [TARGET]"
     IFS='|' read -r _ target ip username port server_name args_b64 <<<"$record"
+    username="${selected_user:-$username}"
+    [[ -n "$username" ]] || die "RDP binding '$name' has no username; configure one or pass --user USER"
     server_name="${server_name:-$target}"
 
     local freerdp
@@ -1628,7 +1666,7 @@ rdp_launch() {
             /cert:*|/cert-tofu|/cert-ignore|/cert-deny) has_cert_policy=1 ;;
         esac
         case "${arg,,}" in
-            /p:*|/password:*|/from-stdin*|/pth:*|/pass-the-hash:*) has_auth_override=1 ;;
+            /u:*|/username:*|/p:*|/password:*|/from-stdin*|/pth:*|/pass-the-hash:*) has_auth_override=1 ;;
         esac
     done
 
@@ -1655,11 +1693,11 @@ rdp_launch() {
     fi
 
     local stored_password=""
-    if (( ! has_auth_override )) && stored_password="$(rdp_credential_lookup "$name")"; then
+    if (( ! has_auth_override )) && stored_password="$(rdp_credential_lookup "$name" "$username")"; then
         grep -q '/from-stdin' <<<"$help_text" \
             || die "stored RDP credentials require FreeRDP /from-stdin support"
         args+=(/from-stdin:force)
-        log "using RDP credential for '$name' from the desktop keyring"
+        log "using RDP credential for '$name' user '$username' from the desktop keyring"
     fi
 
     # Persistent per-machine options first, invocation-specific options last.
@@ -1723,14 +1761,14 @@ Usage:
   ts rdp add NAME ... [--rdp-arg ARG ...] [--clear-rdp-args]
   ts rdp args NAME [-- ARGS...]     Replace persistent per-machine FreeRDP arguments
   ts rdp args NAME --clear         Clear persistent arguments
-  ts rdp credential set NAME       Store the Windows password in the desktop keyring
-  ts rdp credential status NAME    Report whether a password is stored
-  ts rdp credential forget NAME    Remove the stored password
+  ts rdp credential set NAME [--user USER]       Store one Windows account password
+  ts rdp credential status NAME [--user USER]    Report whether that password is stored
+  ts rdp credential forget NAME [--user USER]    Remove that stored password
   ts rdp rm NAME
   ts rdp list
   ts rdp start|stop|restart|status
-  ts rdp MACHINE [--] [extra FreeRDP args...]
-  ts rdp MACHINE --direct [--wait-for-shutdown] [--] [extra FreeRDP args...]
+  ts rdp MACHINE [--user USER] [--] [extra FreeRDP args...]
+  ts rdp MACHINE [--user USER] --direct [--wait-for-shutdown] [--] [extra FreeRDP args...]
 
 Direct endpoint (explicit; never selected automatically):
   ts rdp direct set NAME --address HOST [--port PORT]
@@ -1767,7 +1805,9 @@ Examples:
   ts rdp add brazil 100.92.252.75 --server-name example-i9 --user 'AMAURI-I9\amauri'
   ts rdp args kubuntu -- -rfx
   ts rdp credential set kubuntu
+  ts rdp credential set kubuntu --user 'WINDOWS\\Engineer'
   ts rdp kubuntu
+  ts rdp kubuntu --user 'WINDOWS\\Engineer'
   ts rdp direct set kubuntu --libvirt-user-domain win11 --libvirt-uri qemu:///system --port 13389
   ts rdp direct lifecycle set kubuntu --libvirt-domain win11 --libvirt-uri qemu:///system --start-policy on-demand
   ts rdp kubuntu --direct
@@ -2562,6 +2602,64 @@ config_check() {
     config_check_one "$selector"
 }
 
+prune_config_backups() {
+    local backup_root="$CONFIG_HOME/backups" snapshot index
+    local -a snapshots=()
+    if [[ ! "$CONFIG_BACKUP_KEEP" =~ ^[0-9]+$ ]] || (( 10#$CONFIG_BACKUP_KEEP < 1 )); then
+        die "TS_CONFIG_BACKUP_KEEP must be a positive integer"
+    fi
+    [[ -d "$backup_root" ]] || return 0
+    mapfile -t snapshots < <(
+        find "$backup_root" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null \
+            | awk '/^[0-9]{8}T[0-9]{6}(-[0-9]+)?$/' \
+            | sort -rV
+    )
+    for (( index=10#$CONFIG_BACKUP_KEEP; index<${#snapshots[@]}; index++ )); do
+        snapshot="${snapshots[$index]}"
+        [[ "$snapshot" =~ ^[0-9]{8}T[0-9]{6}(-[0-9]+)?$ ]] \
+            || die "refusing to prune unexpected backup name: $snapshot"
+        rm -rf -- "${backup_root:?}/$snapshot"
+        log "pruned old config backup: $backup_root/$snapshot"
+    done
+}
+
+config_save() {
+    [[ $# -le 1 ]] || die "usage: ts config save [TARGET_DIR]"
+    local target_dir="${1:-.}" stage source destination basename changed=0
+    [[ -d "$target_dir" ]] || die "config save target is not a directory: $target_dir"
+    target_dir="$(cd "$target_dir" && pwd -P)"
+
+    for source in "$RDP_CONFIG" "$SSH_KEYS_CONFIG" "$FLEET_CONFIG"; do
+        [[ -f "$source" && -r "$source" ]] || die "portable config is missing or unreadable: $source"
+    done
+
+    stage="$(mktemp -d "$target_dir/.ts-config-save.XXXXXX")"
+    trap 'rm -rf -- "$stage"' EXIT
+    for source in "$RDP_CONFIG" "$SSH_KEYS_CONFIG" "$FLEET_CONFIG"; do
+        basename="$(basename "$source")"
+        install -m 0600 "$source" "$stage/$basename"
+    done
+
+    for source in "$stage/rdp.tsv" "$stage/ssh-keys.tsv" "$stage/fleet.tsv"; do
+        basename="$(basename "$source")"
+        destination="$target_dir/$basename"
+        [[ ! -L "$destination" ]] || die "refusing to replace symlinked config target: $destination"
+        if [[ -f "$destination" ]] && cmp -s "$source" "$destination"; then
+            chmod 0600 "$destination"
+            log "config save unchanged: $destination"
+            continue
+        fi
+        install -m 0600 "$source" "$target_dir/.$basename.ts-save.tmp"
+        mv -f -- "$target_dir/.$basename.ts-save.tmp" "$destination"
+        log "config saved: $destination"
+        changed=1
+    done
+    rm -rf -- "$stage"
+    trap - EXIT
+    (( changed )) || log "config save: target already matches installed portable configuration"
+    log "host-local direct mappings, bootstrap credentials, keyring secrets, and Tailscale state were not exported"
+}
+
 config_install() {
     have python3 || die "python3 is required for config installation"
 
@@ -2841,6 +2939,7 @@ PY_CONFIG_INSTALL
     [[ -f "$FLEET_CONFIG" ]] && cmp -s "$FLEET_CONFIG" "$stage/fleet.tsv" || fleet_changed=1
 
     if (( ! rdp_changed && ! keys_changed && ! fleet_changed )); then
+        (( dry_run )) || prune_config_backups
         log "config already installed and normalized; no changes"
         return 0
     fi
@@ -2889,6 +2988,7 @@ PY_CONFIG_INSTALL
     if (( was_rdp_running && rdp_changed )); then
         rdp_restart
     fi
+    prune_config_backups
 }
 
 config_show() {
@@ -2901,6 +3001,7 @@ config_show() {
     printf 'credentials:      %s%s\n' "$FLEET_CREDENTIALS" "$([[ -f "$FLEET_CREDENTIALS" ]] && printf ' (present)' || printf ' (absent)')"
     printf 'fleet-registry:   %s\n' "$FLEET_CONFIG"
     printf 'controller-key:   %s%s\n' "$FLEET_IDENTITY" "$([[ -f "$FLEET_IDENTITY" ]] && printf ' (present)' || printf ' (absent)')"
+    printf 'backup-retention: %s snapshots\n' "$CONFIG_BACKUP_KEEP"
 }
 
 config_usage() {
@@ -2912,6 +3013,8 @@ Install / migrate:
       Merge repository, current, and known legacy registries into ~/.config/ts.
       Validation happens before changes; conflicts abort; existing files are backed up.
       Host-local rdp-direct.tsv, ssh-direct.tsv, and credentials.tsv are never imported or overwritten.
+  ts config save [TARGET_DIR]
+      Export installed portable rdp.tsv, ssh-keys.tsv, and fleet.tsv. Default: current directory.
 
 Registry:
   ts config path
@@ -2951,6 +3054,7 @@ config_command() {
     local sub="${1:-help}"; shift || true
     case "$sub" in
         install) config_install "$@" ;;
+        save|export) config_save "$@" ;;
         path) printf '%s\n' "$CONFIG_HOME" ;;
         show) config_show ;;
         key)
@@ -3285,6 +3389,7 @@ Core:
   ts ssh NAME --direct      Lazy direct SSH to a locally managed VM
   ts config ...             Fleet/key registry and authorization propagation
   ts config install [--from DIR]  Merge/migrate repo config into ~/.config/ts
+  ts config save [TARGET_DIR]     Export portable config (default: current directory)
   ts proxy-env              Print proxy environment exports
   ts doctor                 Check local dependencies/runtime
 
@@ -3294,11 +3399,11 @@ RDP:
   ts rdp list
   ts rdp start|stop|restart|status
   ts rdp args NAME [-- ARGS...]   Persist per-machine FreeRDP options
-  ts rdp credential set NAME      Save its Windows password in the desktop keyring
-  ts rdp credential status NAME   Check whether a password is stored
-  ts rdp credential forget NAME   Remove its stored password
-  ts rdp MACHINE [--] [extra FreeRDP args...]
-  ts rdp MACHINE --direct [--wait-for-shutdown] [--] [extra FreeRDP args...]
+  ts rdp credential set NAME [--user USER]      Save one Windows account password
+  ts rdp credential status NAME [--user USER]   Check whether it is stored
+  ts rdp credential forget NAME [--user USER]   Remove that stored password
+  ts rdp MACHINE [--user USER] [--] [extra FreeRDP args...]
+  ts rdp MACHINE [--user USER] --direct [--wait-for-shutdown] [--] [extra FreeRDP args...]
   ts rdp direct set NAME --address HOST [--port PORT]
   ts rdp direct set NAME --libvirt-domain DOMAIN [--libvirt-uri URI] [--mac MAC]
   ts rdp direct set NAME --libvirt-user-domain DOMAIN [--libvirt-uri URI] [--port HOST_PORT]
@@ -3342,6 +3447,7 @@ Environment:
   TS_FLEET_CREDENTIALS       bootstrap password file (default: ~/.config/ts/credentials.tsv)
   TS_FLEET_CONFIG            alternate fleet host registry path
   TS_FLEET_IDENTITY          controller private key (default: ~/.ssh/ts-fleet-ed25519)
+  TS_CONFIG_BACKUP_KEEP      retained config-install snapshots (default: 5)
 EOF_USAGE
 }
 

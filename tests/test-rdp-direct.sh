@@ -62,16 +62,44 @@ assert_contains "$MOCK_FREERDP_LOG" '/server-name:windows-cert'
 assert_contains "$MOCK_FREERDP_LOG" '/f'
 pass 'static direct endpoint launches FreeRDP'
 
-printf 'test-password\ntest-password\n' | "$TS" rdp credential set windows >/dev/null
+printf 'alice-password\nalice-password\n' | "$TS" rdp credential set windows >/dev/null
+printf 'bob-password\nbob-password\n' | "$TS" rdp credential set windows --user Bob >/dev/null
 status="$("$TS" rdp credential status windows)"
 assert_text_contains "$status" 'stored in desktop keyring'
+status="$("$TS" rdp credential status windows --user Bob)"
+assert_text_contains "$status" '[Bob]: stored in desktop keyring'
 run_launch windows --direct
 assert_contains "$MOCK_FREERDP_LOG" '/from-stdin:force'
-[[ "$(cat "$MOCK_FREERDP_STDIN_LOG")" == 'test-password' ]] \
-    || fail 'stored RDP password was not delivered through FreeRDP stdin'
+assert_contains "$MOCK_FREERDP_LOG" '/u:Alice'
+[[ "$(cat "$MOCK_FREERDP_STDIN_LOG")" == 'alice-password' ]] \
+    || fail 'default-user RDP password was not delivered through FreeRDP stdin'
+run_launch windows --user Bob --direct
+assert_contains "$MOCK_FREERDP_LOG" '/u:Bob'
+[[ "$(cat "$MOCK_FREERDP_STDIN_LOG")" == 'bob-password' ]] \
+    || fail 'selected-user RDP password was not delivered through FreeRDP stdin'
+"$TS" rdp credential forget windows --user Bob >/dev/null
 "$TS" rdp credential forget windows >/dev/null
-[[ ! -e "$MOCK_SECRET_STORE" ]] || fail 'RDP credential was not removed'
-pass 'RDP credential uses the desktop keyring and FreeRDP stdin'
+if compgen -G "$MOCK_SECRET_STORE.*" >/dev/null; then fail 'RDP credentials were not removed'; fi
+pass 'per-user RDP credentials use the desktop keyring and FreeRDP stdin'
+
+save_dir="$TEST_ROOT/saved-config"
+mkdir -p "$save_dir"
+"$TS" config host add controller controller --user TestUser --os linux >/dev/null
+(cd "$save_dir" && "$TS" config save >/dev/null)
+cmp "$XDG_CONFIG_HOME/ts/rdp.tsv" "$save_dir/rdp.tsv" >/dev/null
+cmp "$XDG_CONFIG_HOME/ts/ssh-keys.tsv" "$save_dir/ssh-keys.tsv" >/dev/null
+cmp "$XDG_CONFIG_HOME/ts/fleet.tsv" "$save_dir/fleet.tsv" >/dev/null
+backup_root="$XDG_CONFIG_HOME/ts/backups"
+for stamp in 20260101T000001 20260101T000002 20260101T000003 20260101T000004 \
+    20260101T000005 20260101T000006 20260101T000007; do
+    mkdir -p "$backup_root/$stamp"
+done
+bash -c 'source "$1"; prune_config_backups' bash "$TS"
+[[ "$(find "$backup_root" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 5 ]] \
+    || fail 'config backup retention did not keep exactly five snapshots'
+[[ ! -e "$backup_root/20260101T000001" && ! -e "$backup_root/20260101T000002" ]] \
+    || fail 'config backup retention did not remove the oldest snapshots'
+pass 'config save exports portable state and retains five backup snapshots'
 
 cat > "$MOCK_VIRSH_DOMIFLIST" <<'EOF_DOMIFLIST'
  Interface   Type      Source    Model    MAC

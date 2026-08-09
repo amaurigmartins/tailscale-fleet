@@ -2,7 +2,7 @@
 
 Toolkit for turning a pile of Linux machines, Windows boxes, VMware guests, remote workstations, QEMU self-inflicted suffering, and corporate-managed nonsense into one private Tailscale realm without needing root on the client machine.
 
-Current `ts` version: **4.3.0**
+Current `ts` version: **4.4.0**
 
 The executable is simply:
 
@@ -349,12 +349,29 @@ ts rdp credential set windows-qemu
 ts rdp credential set windows-laptop
 ```
 
+Credentials are keyed by both machine and Windows username. Keep several users
+for one machine and select one at launch:
+
+```bash
+ts rdp credential set windows-qemu --user Administrator
+ts rdp credential set windows-qemu --user Engineer
+
+ts rdp windows-qemu --user Administrator --direct
+ts rdp windows-qemu --user Engineer --direct
+```
+
+Without `--user`, the username stored in `rdp.tsv` remains the default.
+The selected value is the exact FreeRDP Windows identity; quote domain-qualified
+forms such as `'WINDOWS-QEMU\Administrator'` in the shell.
+
 The command reads and confirms the password without echoing it. Check or remove
 an entry without ever printing the secret:
 
 ```bash
 ts rdp credential status windows-qemu
+ts rdp credential status windows-qemu --user Engineer
 ts rdp credential forget windows-qemu
+ts rdp credential forget windows-qemu --user Engineer
 ```
 
 When a credential exists, `ts rdp NAME` and `ts rdp NAME --direct` retrieve it
@@ -633,7 +650,7 @@ ts config host list
 
 # `ts config install`
 
-From the private `tailscale-fleet` repo:
+From the `tailscale-fleet` checkout:
 
 ```bash
 ts config install
@@ -664,7 +681,8 @@ The installer:
 - unions compatible SSH authorization scopes;
 - validates loopback addresses, ports, host definitions, key formats, etc.;
 - aborts on real conflicts;
-- makes timestamped backups before replacing existing configuration;
+- makes timestamped backups before replacing existing configuration and retains
+  the newest five snapshots by default;
 - writes files atomically with restrictive permissions;
 - restarts the RDP bridge when its registry changed and the bridge was already running;
 - ignores `rdp-direct.tsv`, `ssh-direct.tsv`, and `credentials.tsv` in the source and preserves local copies;
@@ -680,6 +698,10 @@ ts config install
 
 Boring configuration management is good configuration management.
 
+Backup snapshots live under `~/.config/ts/backups`. Only timestamped snapshots
+created by `ts` participate in pruning. Set `TS_CONFIG_BACKUP_KEEP` to another
+positive integer when five is not the desired retention count.
+
 **`config install` does not propagate SSH keys to remote machines.**
 
 That is a separate operation:
@@ -687,6 +709,26 @@ That is a separate operation:
 ```bash
 ts config push --all
 ```
+
+## Save installed portable configuration
+
+Export the current installed portable registries back into the directory where
+the command is run:
+
+```bash
+ts config save
+```
+
+Or name an existing target directory:
+
+```bash
+ts config save /path/to/tailscale-fleet
+```
+
+This atomically saves `rdp.tsv`, `ssh-keys.tsv`, and `fleet.tsv` with mode
+`0600`. Unchanged files are left alone. It deliberately excludes host-local
+`rdp-direct.tsv` and `ssh-direct.tsv`, bootstrap credentials, desktop-keyring
+secrets, Tailscale state, and private SSH keys.
 
 It also does not automatically commit local registry changes back to Git.
 
@@ -732,12 +774,10 @@ modify the canonical files under:
 
 They do **not** automatically modify or commit the files in the Git checkout.
 
-To refresh the ignored local source copies, use:
+To refresh the ignored local source copies, run from the checkout:
 
 ```bash
-cp ~/.config/ts/rdp.tsv .
-cp ~/.config/ts/ssh-keys.tsv .
-cp ~/.config/ts/fleet.tsv .
+ts config save
 ```
 
 They remain ignored. If inventory versioning is desired, use a separate private
@@ -1247,9 +1287,10 @@ Missing `virsh` or `vmrun` is informational and does not make the overall check 
 ## Tests
 
 The focused smoke tests cover static/direct RDP providers, lazy QEMU RDP and SSH
-forwarding, shutdown waiting, VMware discovery, and desktop-keyring password
-delivery through FreeRDP stdin. They also check that SSH enrollment cannot fall
-back to an implicit personal hub. They use mocked `virsh`, `vmrun`, `ssh`,
+forwarding, shutdown waiting, VMware discovery, per-user desktop-keyring password
+delivery through FreeRDP stdin, portable config export, and five-snapshot backup
+retention. They also check that SSH enrollment cannot fall back to an implicit
+personal hub. They use mocked `virsh`, `vmrun`, `ssh`,
 `secret-tool`, and FreeRDP commands; they do not start real VMs, access the real
 keyring, or touch live registries:
 
@@ -1369,6 +1410,10 @@ TS_FLEET_CONFIG
 TS_FLEET_IDENTITY
     Alternate controller private-key path.
     Default: ~/.ssh/ts-fleet-ed25519
+
+TS_CONFIG_BACKUP_KEEP
+    Number of timestamped config-install snapshots retained.
+    Default: 5
 ```
 
 ---
@@ -1414,9 +1459,11 @@ ts rdp add NAME [TARGET] --user USER
 ts rdp add NAME TARGET --server-name CERT_NAME
 ts rdp list
 ts rdp credential set NAME
+ts rdp credential set NAME --user USER
 ts rdp credential status NAME
 ts rdp credential forget NAME
 ts rdp NAME
+ts rdp NAME --user USER
 ts rdp NAME -- /f
 ts rdp NAME --direct
 ts rdp NAME --direct -- /f
@@ -1445,6 +1492,7 @@ ts rdp direct rm NAME
 ts config install
 ts config install --from DIR
 ts config install --from DIR --dry-run
+ts config save [TARGET_DIR]
 ts config path
 ts config show
 
