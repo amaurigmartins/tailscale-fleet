@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 TS_NAME="ts"
-TS_VERSION="4.2.0"
+TS_VERSION="4.3.0"
 DAEMON_APP="tailscale-user"   # Preserve compatibility with the earlier installer/state.
 
 BASE="${TAILSCALE_USER_HOME:-$HOME/.local/share/$DAEMON_APP}"
@@ -2402,17 +2402,10 @@ config_bootstrap() {
 }
 
 config_enroll_one() {
-    local name="$1" hub="$2" rec target user os key_spec key_type key_data script encoded
+    local name="$1" targets="$2" rec target user os key_spec key_type key_data script encoded
     rec="$(fleet_record "$name" 2>/dev/null || true)"
     [[ -n "$rec" ]] || die "unknown fleet host '$name'"
     IFS='|' read -r _ target user os <<< "$rec"
-
-    if [[ "$name" == "$hub" ]]; then
-        [[ -r "$HOME/.ssh/id_ed25519.pub" ]] \
-            || die "hub login public key is missing: $HOME/.ssh/id_ed25519.pub"
-        config_key_add "$name" "$(head -n 1 "$HOME/.ssh/id_ed25519.pub")" --on '*'
-        return 0
-    fi
 
     script="$(mktemp "${TMPDIR:-/tmp}/ts-enroll.XXXXXX")"
     local -a ssh_cmd
@@ -2458,24 +2451,51 @@ EOF_ENROLL_WINDOWS
     [[ -n "$key_spec" ]] || die "failed to create or read the login public key for '$name'"
     read -r key_type key_data _ <<< "$key_spec"
     key_spec="$key_type $key_data ts-login:$name"
-    config_key_add "$name" "$key_spec" --on "$hub"
-    log "enrolled login identity from $name for passwordless SSH back to $hub"
+    config_key_add "$name" "$key_spec" --on "$targets"
+    log "enrolled login identity from $name; authorized on $targets"
+}
+
+enroll_targets_without_source() {
+    local source="$1" targets="$2" target result=""
+    local -a target_items=()
+    [[ "$targets" != '*' ]] || { printf '*\n'; return; }
+    IFS=',' read -r -a target_items <<< "$targets"
+    for target in "${target_items[@]}"; do
+        [[ "$target" != "$source" ]] || continue
+        if [[ -n "$result" ]]; then result+=","; fi
+        result+="$target"
+    done
+    printf '%s\n' "$result"
 }
 
 config_enroll() {
-    [[ $# -ge 1 ]] || die "usage: ts config enroll HOST|--all [--hub FLEET_NAME]"
-    local selector="$1" hub="amauri-zbook" name rc=0; shift
+    [[ $# -ge 1 ]] || die "usage: ts config enroll HOST|--all --on HOST[,HOST...]|*"
+    local selector="$1" targets="" name target scoped_targets rc=0; shift
+    local -a target_items=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --hub) [[ $# -ge 2 ]] || die "--hub requires a fleet name"; hub="$2"; shift 2 ;;
+            --on) [[ $# -ge 2 ]] || die "--on requires authorization targets"; targets="$2"; shift 2 ;;
             *) die "unknown enroll option: $1" ;;
         esac
     done
-    fleet_record "$hub" >/dev/null 2>&1 || die "unknown hub fleet host '$hub'"
+    [[ -n "$targets" ]] || die "config enroll requires explicit --on HOST[,HOST...]|*"
+    if [[ "$targets" != '*' ]]; then
+        IFS=',' read -r -a target_items <<< "$targets"
+        (( ${#target_items[@]} )) || die "--on requires at least one fleet host"
+        for target in "${target_items[@]}"; do
+            validate_config_name "$target"
+            fleet_record "$target" >/dev/null 2>&1 || die "unknown authorization target '$target'"
+        done
+    fi
     if [[ "$selector" == --all || "$selector" == all ]]; then
         while IFS='|' read -r name _ <&3; do
             [[ -n "$name" && "$name" != \#* ]] || continue
-            if config_enroll_one "$name" "$hub"; then
+            scoped_targets="$(enroll_targets_without_source "$name" "$targets")"
+            if [[ -z "$scoped_targets" ]]; then
+                log "enroll SKIPPED: $name is the sole authorization target"
+                continue
+            fi
+            if config_enroll_one "$name" "$scoped_targets"; then
                 log "enroll OK: $name"
             else
                 log "enroll FAILED: $name"
@@ -2483,10 +2503,12 @@ config_enroll() {
             fi
         done 3< "$FLEET_CONFIG"
     else
-        config_enroll_one "$selector" "$hub"
+        scoped_targets="$(enroll_targets_without_source "$selector" "$targets")"
+        [[ -n "$scoped_targets" ]] \
+            || die "cannot enroll '$selector' only onto itself; choose another --on target"
+        config_enroll_one "$selector" "$scoped_targets"
     fi
-    write_managed_authorized_keys_local "$hub"
-    log "installed enrolled fleet login keys on local hub '$hub'"
+    log "enrollment updated the key registry; apply or push the affected targets explicitly"
     return "$rc"
 }
 
@@ -2914,8 +2936,8 @@ Controller / authorization:
   ts config push --all               Push applicable keys to every fleet host
   ts config bootstrap HOST|--all [--credentials FILE]
                                       First push using passwords from a mode-0600 file
-  ts config enroll HOST|--all [--hub FLEET_NAME]
-                                      Create/read remote user login keys and authorize them on the hub
+  ts config enroll HOST|--all --on HOST[,HOST...]|*
+                                      Create/read user login keys with explicit authorization targets
   ts config sync HOST|--all          Alias for push
   ts config check HOST|--all         Test passwordless controller SSH
 
@@ -3291,7 +3313,7 @@ Fleet configuration:
   ts config host add NAME [TARGET] --user USER --os linux|windows
   ts config push HOST|--all
   ts config bootstrap HOST|--all --credentials FILE
-  ts config enroll HOST|--all --hub FLEET_NAME
+  ts config enroll HOST|--all --on HOST[,HOST...]|*
   ts config check HOST|--all
   ts config help
 

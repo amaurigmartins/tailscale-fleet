@@ -2,7 +2,7 @@
 
 Toolkit for turning a pile of Linux machines, Windows boxes, VMware guests, remote workstations, QEMU self-inflicted suffering, and corporate-managed nonsense into one private Tailscale realm without needing root on the client machine.
 
-Current `ts` version: **4.2.0**
+Current `ts` version: **4.3.0**
 
 The executable is simply:
 
@@ -345,16 +345,16 @@ keys. Passwordless launch requires `secret-tool` (from libsecret) and a working
 desktop Secret Service such as GNOME Keyring. Store the current password once:
 
 ```bash
-ts rdp credential set amauri-qemu
-ts rdp credential set barbara-vostro
+ts rdp credential set windows-qemu
+ts rdp credential set windows-laptop
 ```
 
 The command reads and confirms the password without echoing it. Check or remove
 an entry without ever printing the secret:
 
 ```bash
-ts rdp credential status amauri-qemu
-ts rdp credential forget amauri-qemu
+ts rdp credential status windows-qemu
+ts rdp credential forget windows-qemu
 ```
 
 When a credential exists, `ts rdp NAME` and `ts rdp NAME --direct` retrieve it
@@ -766,10 +766,9 @@ identifiers. `fleet.tsv`, `rdp.tsv`, and the direct registries similarly reveal
 network topology and local machine details. They remain ignored for privacy and
 operational compartmentalization, not because every field is a credential.
 
-The tracked code and examples intentionally retain personal deployment aliases
-such as `amauri-zbook`, `amauri-qemu`, and `barbara-vostro`, plus the local login
-name `amartins`. They grant no access, but they do disclose naming/topology
-information. Replace them before publication if anonymity matters.
+The tracked documentation uses generic example aliases. New examples should stay
+generic so publishing the reusable source does not disclose a real deployment's
+naming or topology.
 
 Before changing visibility or publishing a new commit, verify the boundary:
 
@@ -995,8 +994,8 @@ existing SSH credential. For temporary passwords, create a gitignored file with
 mode `0600`:
 
 ```text
-amauri-qemu|TEMPORARY_WINDOWS_PASSWORD
-barbara-vostro|TEMPORARY_WINDOWS_PASSWORD
+windows-qemu|TEMPORARY_WINDOWS_PASSWORD
+windows-laptop|TEMPORARY_WINDOWS_PASSWORD
 ```
 
 Then bootstrap only the hosts listed in that file:
@@ -1010,16 +1009,18 @@ Passwords are read by SSH through `SSH_ASKPASS`; they are not placed in command
 arguments, copied remotely, added to the key registry, or printed. Delete the
 file after successful bootstrap.
 
-After the ZBook key is accepted, enroll each machine's standard user login key
-for passwordless return SSH:
+After the controller key is accepted, enroll each machine's standard user login
+key with explicit authorization targets:
 
 ```bash
-ts config enroll HOST --hub amauri-zbook
+ts config enroll HOST --on controller
+ts config apply controller
 ```
 
 Enrollment creates `~/.ssh/id_ed25519` (or `%USERPROFILE%\.ssh\id_ed25519`)
-only when it is missing, retrieves only the `.pub` half, scopes it to
-`amauri-zbook`, and updates the ZBook's managed `authorized_keys` block.
+only when it is missing, retrieves only the `.pub` half, and scopes it to the
+hosts named by `--on`. Enrollment changes the key registry; `config apply`
+updates the current machine, while `config push` updates a remote target.
 
 The lower-level first-contact alternatives remain:
 
@@ -1033,23 +1034,23 @@ After the controller key has been propagated, later pushes should be passwordles
 
 ---
 
-# ZBook hub-and-spoke SSH
+# Optional controller-and-spoke SSH policy
 
-The personal fleet policy is intentionally simple:
+A controller-and-spoke deployment can choose this explicit policy:
 
 ```text
-amauri-zbook login key:  targets=*
-remote login key:        targets=amauri-zbook
+controller login key:  targets=*
+remote login key:      targets=controller
 ```
 
 That gives:
 
 ```text
-ZBook ──SSH/RDP──► every fleet machine
-every fleet machine ──SSH/file transfer──► ZBook
+Controller ──SSH/RDP──► every fleet machine
+every fleet machine ──SSH/file transfer──► Controller
 ```
 
-The rootless ZBook publishes its existing local SSH server privately through
+The rootless controller publishes its existing local SSH server privately through
 Tailscale Serve:
 
 ```bash
@@ -1059,7 +1060,7 @@ tailscale serve --bg --tcp 22 tcp://127.0.0.1:22
 It remains private to the tailnet. Remote machines connect normally:
 
 ```bash
-ssh amartins@amauri-zbook
+ssh controller-user@controller
 ```
 
 ## Direct SSH to a local QEMU guest
@@ -1067,7 +1068,7 @@ ssh amartins@amauri-zbook
 Configure once on the enclosing host:
 
 ```bash
-ts ssh direct set amauri-qemu \
+ts ssh direct set windows-qemu \
     --libvirt-user-domain win11 \
     --libvirt-uri qemu:///system \
     --host-address 127.0.0.1 \
@@ -1080,20 +1081,20 @@ ts ssh direct set amauri-qemu \
 Then connect with:
 
 ```bash
-ts ssh amauri-qemu --direct
+ts ssh windows-qemu --direct
 ```
 
 Inspect or remove the host-local mapping with:
 
 ```bash
-ts ssh direct show amauri-qemu
+ts ssh direct show windows-qemu
 ts ssh direct list
-ts ssh direct rm amauri-qemu
+ts ssh direct rm windows-qemu
 ```
 
 This lazily starts the VM, injects/reuses the QEMU localhost forward, waits for
 Windows OpenSSH, and connects with the fleet login user. The reverse direct path
-from this QEMU guest to its enclosing ZBook is `amartins@10.0.2.2:22`; it uses
+from this QEMU guest to its enclosing host is `controller-user@10.0.2.2:22`; it uses
 the same login keys as the Tailscale path.
 
 It does not manufacture missing private keys on source machines, start missing SSH servers, or test every possible N² source/destination pair.
@@ -1247,7 +1248,8 @@ Missing `virsh` or `vmrun` is informational and does not make the overall check 
 
 The focused smoke tests cover static/direct RDP providers, lazy QEMU RDP and SSH
 forwarding, shutdown waiting, VMware discovery, and desktop-keyring password
-delivery through FreeRDP stdin. They use mocked `virsh`, `vmrun`, `ssh`,
+delivery through FreeRDP stdin. They also check that SSH enrollment cannot fall
+back to an implicit personal hub. They use mocked `virsh`, `vmrun`, `ssh`,
 `secret-tool`, and FreeRDP commands; they do not start real VMs, access the real
 keyring, or touch live registries:
 
@@ -1468,7 +1470,7 @@ ts config push HOST
 ts config push --all
 ts config sync --all
 ts config bootstrap HOST|--all --credentials ./credentials.tsv
-ts config enroll HOST|--all --hub amauri-zbook
+ts config enroll HOST|--all --on HOST[,HOST...]|*
 ts config check HOST
 ts config check --all
 

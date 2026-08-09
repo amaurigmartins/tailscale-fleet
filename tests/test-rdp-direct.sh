@@ -111,6 +111,16 @@ fi
 pass 'libvirt user networking starts the VM, creates its forward, and waits for shutdown'
 
 "$TS" config host add windows windows-dev --user Alice --os windows >/dev/null
+if "$TS" config enroll windows > "$TEST_ROOT/enroll-error" 2>&1; then
+    fail 'config enroll accepted an implicit authorization target'
+fi
+assert_text_contains "$(cat "$TEST_ROOT/enroll-error")" 'requires explicit --on'
+if "$TS" config enroll windows --on windows > "$TEST_ROOT/enroll-error" 2>&1; then
+    fail 'config enroll accepted a sole self-authorization target'
+fi
+assert_text_contains "$(cat "$TEST_ROOT/enroll-error")" 'cannot enroll'
+pass 'SSH enrollment requires explicit non-self authorization targets'
+
 "$TS" ssh direct set windows --libvirt-user-domain windows-dev --libvirt-uri qemu:///system \
     --host-address 127.0.0.1 --port 10022 --guest-port 22 --netdev hostnet0 \
     --start-policy on-demand --boot-timeout 2 >/dev/null
