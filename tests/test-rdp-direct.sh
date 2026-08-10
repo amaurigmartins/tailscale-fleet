@@ -89,6 +89,7 @@ mkdir -p "$save_dir"
 cmp "$XDG_CONFIG_HOME/ts/rdp.tsv" "$save_dir/rdp.tsv" >/dev/null
 cmp "$XDG_CONFIG_HOME/ts/ssh-keys.tsv" "$save_dir/ssh-keys.tsv" >/dev/null
 cmp "$XDG_CONFIG_HOME/ts/fleet.tsv" "$save_dir/fleet.tsv" >/dev/null
+cmp "$XDG_CONFIG_HOME/ts/mounts.tsv" "$save_dir/mounts.tsv" >/dev/null
 backup_root="$XDG_CONFIG_HOME/ts/backups"
 for stamp in 20260101T000001 20260101T000002 20260101T000003 20260101T000004 \
     20260101T000005 20260101T000006 20260101T000007; do

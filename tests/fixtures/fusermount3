@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -eu
+
+: "${MOCK_FUSERMOUNT_LOG:?}"
+: "${MOCK_MOUNT_STATE:?}"
+printf '%s\n' "$@" >> "$MOCK_FUSERMOUNT_LOG"
+mountpoint="${!#}"
+tmp="${MOCK_MOUNT_STATE}.tmp"
+awk -F '|' -v wanted="$mountpoint" '$1 != wanted' "$MOCK_MOUNT_STATE" > "$tmp"
+mv -f -- "$tmp" "$MOCK_MOUNT_STATE"

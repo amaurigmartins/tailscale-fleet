@@ -1,5 +1,6 @@
 ssh-keys.tsv
 fleet.tsv
+mounts.tsv
 rdp.tsv
 rdp-direct.tsv
 ssh-direct.tsv

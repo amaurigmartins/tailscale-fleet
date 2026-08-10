@@ -2,7 +2,7 @@
 
 Toolkit for turning a pile of Linux machines, Windows boxes, VMware guests, remote workstations, QEMU self-inflicted suffering, and corporate-managed nonsense into one private Tailscale realm without needing root on the client machine.
 
-Current `ts` version: **4.4.0**
+Current `ts` version: **4.5.0**
 
 The executable is simply:
 
@@ -38,6 +38,14 @@ Rocky / rootless Linux
         |
         +---- Tailscale Serve :22 <--------------- fleet return SSH
         |
+        +---- SSHFS/FUSE ------------------------> fleet host SFTP
+        |       +-- ~/tailscale-fleet/MACHINE/SHARE
+        |       +-- ProxyCommand: ts nc HOST 22
+        |
+        +---- Windows ACL control ---------------> PowerShell / icacls
+        |       +-- current SSH identity SID
+        |       +-- explicit ownership/system-drive guards
+        |
         +---- RDP bridge 127.77.0.x:3389 --------> Windows :3389
         |          |
         |          +---- FreeRDP
@@ -65,7 +73,6 @@ tailscale-fleet/
 ├── ts
 ├── README.md
 ├── .gitignore
-├── ssh-keys.tsv.sample
 └── tests/
 ```
 
@@ -77,6 +84,7 @@ tailscale-fleet/
 ├── rdp.tsv
 ├── ssh-keys.tsv
 ├── fleet.tsv
+├── mounts.tsv
 ├── rdp-direct.tsv
 ├── ssh-direct.tsv
 └── credentials.tsv
@@ -97,6 +105,7 @@ Canonical local configuration is:
 ├── ssh-direct.tsv       # host-local; never imported from the repo
 ├── ssh-keys.tsv
 ├── fleet.tsv
+├── mounts.tsv           # portable declarative SSHFS shares
 ├── credentials.tsv      # optional bootstrap passwords; never imported
 └── backups/
 ```
@@ -195,6 +204,11 @@ ts ping MACHINE
 ts netcheck
 ts ip -4
 ts whois 100.x.y.z
+
+ts mounts
+ts mount MACHINE --all
+ts unmount MACHINE --all
+ts acl show WINDOWS_MACHINE PATH_OR_SHARE
 
 ts version
 ts update
@@ -613,14 +627,277 @@ The SSH server must actually exist on the destination. `ts` can bend networking 
 
 ---
 
+# Managed fleet filesystems
+
+The rootless controller has no kernel Tailscale route, but SSHFS does not need
+one. Its SFTP connection uses the same OpenSSH `ProxyCommand` transport as
+`ts ssh`:
+
+```text
+ROOTLESS CONTROLLER
+
+~/tailscale-fleet/
+├── windows-box/
+│   ├── drive_c/
+│   ├── drive_d/
+│   └── drive_f/
+├── windows-vm/
+│   ├── drive_c/
+│   └── drive_d/
+└── linux-machine/
+    ├── home/
+    └── data/
+
+drive_c
+    |
+    +-- SSHFS/FUSE
+          |
+          +-- SFTP / OpenSSH
+                |
+                +-- ProxyCommand: ts nc %h %p
+                      |
+                      +-- rootless userspace tailscaled
+                            |
+                            +-- Tailscale -> Windows OpenSSH -> C:\
+```
+
+No sudo, no TUN device, no assumption that the operating system can route to a
+`100.x` address. FUSE mounts appear naturally in GNOME Files, and the local
+namespace does not change according to whatever random directory seemed
+available when the mount was first tested.
+
+And apparently moving files between VMs in 2026 still requires personally
+assembling a small distributed operating system because VM tooling remains
+offended by the concept of convenient file access and functioning
+Ctrl+C/Ctrl+V.
+
+## Mount registry
+
+`~/.config/ts/mounts.tsv` is portable declarative configuration:
+
+```text
+MACHINE|SHARE|REMOTE|USER
+windows-box|drive_c|/C:/|
+windows-box|drive_d|/D:/|User
+linux-box|home|/home/user|
+linux-box|data|/srv/data|
+```
+
+An empty `USER` inherits the SSH login user from `fleet.tsv`. A mount machine
+must already exist there because its target, user, and OS metadata are part of
+the transport. The local path is derived rather than stored:
+
+```text
+${TS_MOUNT_ROOT:-$HOME/tailscale-fleet}/MACHINE/SHARE
+```
+
+Machine and share identifiers cannot contain `/`, `..`, or other traversal
+syntax. `TS_MOUNT_ROOT` must be absolute.
+
+Register a generic remote path:
+
+```bash
+ts mount add linux-box home --remote /home/user
+ts mount add linux-box data --remote /srv/data --user another-login
+```
+
+Windows OpenSSH exposes drive roots through SFTP as `/C:/`, `/D:/`, and so on.
+The shorthand validates and normalizes one drive letter:
+
+```bash
+ts mount add windows-box drive_c --drive C
+ts mount add windows-box drive_d --drive D
+ts mount add windows-box drive_f --drive F
+```
+
+Adding the same `MACHINE + SHARE` replaces that definition atomically instead
+of making a duplicate. Inspect or remove definitions with:
+
+```bash
+ts mount list
+ts mount rm windows-box drive_f
+```
+
+An active definition must be unmounted before it can be removed; otherwise the
+live FUSE mount would become unmanaged and disappear from `ts mounts`.
+
+## Mount and unmount
+
+Mount one share, every share for a machine, or the complete registry:
+
+```bash
+ts mount windows-box drive_d
+ts mount windows-box --all
+ts mount --all
+```
+
+Every SSHFS connection includes:
+
+```text
+ProxyCommand=<current ts executable> nc %h %p
+reconnect
+ServerAliveInterval=15
+ServerAliveCountMax=3
+StrictHostKeyChecking=accept-new
+```
+
+The dedicated fleet identity is also used when present. Host-key verification
+is not disabled. Invocation-specific SSHFS arguments go after `--` and are
+appended after the defaults without `eval`:
+
+```bash
+ts mount windows-box drive_d -- -o cache=yes
+```
+
+Repeated mounting is idempotent. `ts` checks the actual mount table and the
+fleet `fsname`; it does not mistake an existing empty directory for a live
+filesystem. If some unrelated filesystem occupies the deterministic path, it
+refuses to stack another mount there.
+
+Runtime inspection combines configuration with real OS mount state:
+
+```bash
+ts mounts
+```
+
+```text
+MACHINE       SHARE      REMOTE   LOCAL                                      STATE
+windows-box    drive_c    /C:/     ~/tailscale-fleet/windows-box/drive_c      mounted
+windows-box    drive_d    /D:/     ~/tailscale-fleet/windows-box/drive_d      mounted
+windows-box    drive_f    /F:/     ~/tailscale-fleet/windows-box/drive_f      unmounted
+```
+
+Unmounting is likewise single-share or batched and uses `fusermount3` (or the
+compatible user FUSE tool) without sudo:
+
+```bash
+ts unmount windows-box drive_d
+ts unmount windows-box --all
+ts unmount --all
+```
+
+An already-unmounted share is a success. Mountpoint directories may remain;
+`ts` never recursively deletes arbitrary content under the mount root. Batch
+operations attempt every independent record, report individual failures, and
+return failure if any item failed.
+
+SSHFS, a compatible FUSE unmount command, and accessible `/dev/fuse` are needed
+only for mounting. Their absence does not affect SSH, RDP, ACL inspection, or
+native Tailscale passthrough.
+
+---
+
+# Remote Windows ACL control
+
+Windows OpenSSH/SFTP can reach a drive while NTFS ACLs still hide parts of its
+tree from the SSH account. `ts` can inspect or explicitly grant that same remote
+SSH security principal Full Control:
+
+```bash
+ts acl show windows-box 'D:\Projects'
+ts acl grant windows-box 'D:\Projects'
+```
+
+Mount aliases resolve exactly through `mounts.tsv`:
+
+```bash
+ts acl show windows-box drive_d
+ts acl grant windows-box drive_d
+```
+
+For a definition such as `windows-box|drive_d|/D:/|`, `drive_d` becomes `D:\`.
+Supported OpenSSH paths such as `/D:/Research` become `D:\Research`. Other
+remote path formats are not guessed; provide a native Windows path explicitly.
+There is no fuzzy alias matching.
+
+ACL commands are accepted only for fleet hosts whose `fleet.tsv` OS is
+`windows`. They run over the existing SSH -> `ts nc` -> rootless Tailscale
+transport. There is no WinRM side channel.
+
+## What grant changes
+
+The remote PowerShell payload obtains the real current SSH identity and numeric
+SID through Windows APIs. It passes the SID to `icacls.exe` in numeric form and
+uses a replace-style grant equivalent to:
+
+```text
+SID:(OI)(CI)F /T /C
+```
+
+That grants Full Control to the requested tree, replaces repeat grants for only
+that principal, and preserves unrelated ACEs. It does **not** reset the ACL,
+disable inheritance globally, replace SYSTEM/Administrators/TrustedInstaller
+entries, or infer a brittle `MACHINE\User` name.
+
+Mutation requires an elevated remote SSH token. An unelevated session fails
+before `takeown` or `icacls` mutation and reports the remote account. `ts` does
+not disable UAC, change `LocalAccountTokenFilterPolicy`, or alter Windows
+security policy. Remote-token filtering may explain an unelevated token; fixing
+that policy remains an operator decision.
+
+## Dangerous escalation flags
+
+Normal grant never changes ownership. If ACL modification cannot succeed with
+the current owner/control state, it fails. Ownership is available only with the
+deliberately invasive flag:
+
+```bash
+ts acl grant windows-box drive_f --take-ownership
+```
+
+This runs recursive `takeown.exe` as the current SSH account before `icacls` and
+reports that ownership changed. Review the target first.
+
+Recursive Full Control over the exact `C:\` root includes Windows, Program
+Files, system data, and service-owned paths, so it is refused unless separately
+acknowledged:
+
+```bash
+ts acl grant windows-box drive_c --system-drive
+```
+
+An ordinary folder on C does not need that flag:
+
+```bash
+ts acl grant windows-box 'C:\Users\User\Projects'
+```
+
+Whole-C ownership escalation requires both acknowledgements:
+
+```bash
+ts acl grant windows-box drive_c \
+    --system-drive \
+    --take-ownership
+```
+
+`--take-ownership` and `--system-drive` are not convenience switches. They are
+there so destructive scope cannot be reached by accident or implication.
+
+## PowerShell transport safety
+
+Paths with spaces, apostrophes, parentheses, `&`, and Unicode are encoded as
+UTF-8/base64 data. The local script decodes that data inside PowerShell; the
+complete script is then encoded as UTF-16LE/base64 and sent with:
+
+```text
+powershell.exe -NoProfile -NonInteractive -EncodedCommand PAYLOAD
+```
+
+No user path is interpolated into executable PowerShell source or a remote shell
+quote maze. Quoted heredocs preserve PowerShell backticks, and neither mount nor
+ACL code uses `eval`.
+
+---
+
 # Fleet configuration
 
-There are three portable registries and two host-local direct-transport registries:
+There are four portable registries and two host-local direct-transport registries:
 
 ```text
 rdp.tsv          portable RDP identities and Tailscale endpoints
 ssh-keys.tsv     client login public keys copied to authorized_keys
 fleet.tsv        SSH destinations: target, login user, and OS
+mounts.tsv       declarative SSHFS shares; local mountpoints are derived
 rdp-direct.tsv   local direct-RDP hypervisor mappings; never shared
 ssh-direct.tsv   local direct-SSH hypervisor mappings; never shared
 ```
@@ -679,12 +956,14 @@ The installer:
 - merges equivalent records;
 - deduplicates SSH keys by actual public-key material;
 - unions compatible SSH authorization scopes;
-- validates loopback addresses, ports, host definitions, key formats, etc.;
+- validates loopback addresses, ports, host definitions, key formats, mount
+  identifiers, remote paths, and mount-to-fleet references;
 - aborts on real conflicts;
 - makes timestamped backups before replacing existing configuration and retains
   the newest five snapshots by default;
 - writes files atomically with restrictive permissions;
 - restarts the RDP bridge when its registry changed and the bridge was already running;
+- never mounts, unmounts, or otherwise changes active FUSE runtime state;
 - ignores `rdp-direct.tsv`, `ssh-direct.tsv`, and `credentials.tsv` in the source and preserves local copies;
 - is idempotent.
 
@@ -725,8 +1004,8 @@ Or name an existing target directory:
 ts config save /path/to/tailscale-fleet
 ```
 
-This atomically saves `rdp.tsv`, `ssh-keys.tsv`, and `fleet.tsv` with mode
-`0600`. Unchanged files are left alone. It deliberately excludes host-local
+This atomically saves `rdp.tsv`, `ssh-keys.tsv`, `fleet.tsv`, and `mounts.tsv`
+with mode `0600`. Unchanged files are left alone. It deliberately excludes host-local
 `rdp-direct.tsv` and `ssh-direct.tsv`, bootstrap credentials, desktop-keyring
 secrets, Tailscale state, and private SSH keys.
 
@@ -742,6 +1021,7 @@ The default `.gitignore` keeps all live fleet inventory out of Git:
 rdp.tsv
 ssh-keys.tsv
 fleet.tsv
+mounts.tsv
 rdp-direct.tsv
 ssh-direct.tsv
 credentials.tsv
@@ -749,7 +1029,7 @@ credentials.tsv
 
 Those ignored files may still live in the checkout and be consumed by
 `ts config install --from .`; Git simply does not publish them. The tracked
-repository contains the reusable CLI, documentation, tests, and a fake sample.
+repository contains the reusable CLI, documentation, and tests.
 
 Install/merge from Git:
 
@@ -764,6 +1044,7 @@ Changes made with commands such as:
 ts rdp add ...
 ts config key ...
 ts config host ...
+ts mount add ...
 ```
 
 modify the canonical files under:
@@ -802,7 +1083,7 @@ be committed:
 
 `ssh-keys.tsv` contains public keys rather than private secrets, but publishing
 it still discloses fleet names, usernames, authorization scope, and stable
-identifiers. `fleet.tsv`, `rdp.tsv`, and the direct registries similarly reveal
+identifiers. `fleet.tsv`, `mounts.tsv`, `rdp.tsv`, and the direct registries similarly reveal
 network topology and local machine details. They remain ignored for privacy and
 operational compartmentalization, not because every field is a credential.
 
@@ -1245,7 +1526,7 @@ ts purge
 - persistent Tailscale node state;
 - `~/.config/ts`;
 - RDP configuration;
-- fleet/key registries.
+- fleet/key/mount registries.
 
 After `purge`, expect to authenticate the Tailscale node again.
 
@@ -1276,26 +1557,35 @@ It reports the state of:
 - RDP bridge;
 - host-local direct RDP mappings;
 - optional `virsh`, libvirt-connection, and `vmrun` capabilities;
+- optional `sshfs`, `fusermount3`/compatible FUSE, and `/dev/fuse` capability;
+- configured and actually active fleet-mount counts;
 - SSH-key registry;
 - fleet registry;
 - controller key.
 
 It is a sanity check, not divine revelation.
 
-Missing `virsh` or `vmrun` is informational and does not make the overall check fail. Those tools are required only when a configured direct provider uses them.
+Missing `virsh`, `vmrun`, SSHFS, or FUSE is informational and does not make the
+overall check fail. Those tools are required only when their corresponding
+direct or mount capability is used.
 
 ## Tests
 
 The focused smoke tests cover static/direct RDP providers, lazy QEMU RDP and SSH
 forwarding, shutdown waiting, VMware discovery, per-user desktop-keyring password
 delivery through FreeRDP stdin, portable config export, and five-snapshot backup
-retention. They also check that SSH enrollment cannot fall back to an implicit
-personal hub. They use mocked `virsh`, `vmrun`, `ssh`,
-`secret-tool`, and FreeRDP commands; they do not start real VMs, access the real
-keyring, or touch live registries:
+retention. Mount/ACL tests cover registry replacement and merge conflicts,
+deterministic paths, SSHFS construction and passthrough, real-state detection,
+batch partial failures, encoded Unicode PowerShell payloads, SID grants,
+ownership ordering, system-drive protection, OS guards, and elevation errors.
+They also check that SSH enrollment cannot fall back to an implicit personal
+hub. They use mocked `sshfs`, `findmnt`, `fusermount3`, `virsh`, `vmrun`, `ssh`,
+`secret-tool`, and FreeRDP commands; they do not mount filesystems, contact a
+Windows host, start real VMs, access the real keyring, or touch live registries:
 
 ```bash
 tests/test-rdp-direct.sh
+tests/test-mount-acl.sh
 ```
 
 ---
@@ -1347,6 +1637,31 @@ Then:
 ```bash
 ts ping hostname-vmware
 ts rdp hostname-vmware
+```
+
+Register and mount its Windows drives once OpenSSH/SFTP is available:
+
+```bash
+ts mount add hostname-vmware drive_c --drive C
+ts mount add hostname-vmware drive_d --drive D
+ts mount add hostname-vmware drive_f --drive F
+
+ts mount hostname-vmware --all
+ts mounts
+```
+
+If NTFS permissions hide part of `drive_f`, inspect before changing it:
+
+```bash
+ts acl show hostname-vmware drive_f
+ts acl grant hostname-vmware drive_f
+```
+
+The active SSHFS mount sees access changes without redefining the share. When
+finished:
+
+```bash
+ts unmount hostname-vmware --all
 ```
 
 ## Add a Linux fleet machine
@@ -1407,6 +1722,13 @@ TS_FLEET_CREDENTIALS
 TS_FLEET_CONFIG
     Alternate fleet registry.
 
+TS_MOUNTS_CONFIG
+    Alternate portable mount registry.
+
+TS_MOUNT_ROOT
+    Deterministic local fleet mount root.
+    Default: ~/tailscale-fleet
+
 TS_FLEET_IDENTITY
     Alternate controller private-key path.
     Default: ~/.ssh/ts-fleet-ed25519
@@ -1453,6 +1775,27 @@ ts ssh direct set NAME --libvirt-user-domain DOMAIN --libvirt-uri URI --port HOS
 ts ssh direct show NAME
 ts ssh direct list
 ts ssh direct rm NAME
+
+# Managed SSHFS mounts
+ts mount add MACHINE SHARE --remote PATH [--user USER]
+ts mount add MACHINE SHARE --drive LETTER [--user USER]
+ts mount rm MACHINE SHARE
+ts mount list
+ts mount MACHINE SHARE
+ts mount MACHINE SHARE -- -o cache=yes
+ts mount MACHINE --all
+ts mount --all
+ts mounts
+ts unmount MACHINE SHARE
+ts unmount MACHINE --all
+ts unmount --all
+
+# Remote Windows ACLs
+ts acl show MACHINE PATH_OR_SHARE
+ts acl grant MACHINE PATH_OR_SHARE
+ts acl grant MACHINE PATH_OR_SHARE --take-ownership
+ts acl grant MACHINE PATH_OR_SHARE --system-drive
+ts acl grant MACHINE PATH_OR_SHARE --system-drive --take-ownership
 
 # RDP
 ts rdp add NAME [TARGET] --user USER
@@ -1543,6 +1886,9 @@ ts purge
 7. **Do not disable RDP certificate validation merely because loopback bridging makes hostname verification inconvenient.**
 8. **Pass arbitrary FreeRDP arguments through rather than hard-code every future workaround.**
 9. **Private controller keys never enter the config repo.**
-10. **Clipboard must fucking work.**
+10. **Mountpoints are derived; live FUSE state is inspected, not imagined.**
+11. **Windows ACL changes are explicit, SID-based, and never silently take ownership.**
+12. **User-controlled Windows paths travel as encoded data, not quote soup.**
+13. **Clipboard must fucking work.**
 
 That last one is not negotiable.

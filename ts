@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 TS_NAME="ts"
-TS_VERSION="4.4.0"
+TS_VERSION="4.5.0"
 DAEMON_APP="tailscale-user"   # Preserve compatibility with the earlier installer/state.
 
 BASE="${TAILSCALE_USER_HOME:-$HOME/.local/share/$DAEMON_APP}"
@@ -27,6 +27,7 @@ RDP_DIRECT_CONFIG="${TS_RDP_DIRECT_CONFIG:-$CONFIG_HOME/rdp-direct.tsv}"
 SSH_KEYS_CONFIG="${TS_SSH_KEYS_CONFIG:-$CONFIG_HOME/ssh-keys.tsv}"
 SSH_DIRECT_CONFIG="${TS_SSH_DIRECT_CONFIG:-$CONFIG_HOME/ssh-direct.tsv}"
 FLEET_CONFIG="${TS_FLEET_CONFIG:-$CONFIG_HOME/fleet.tsv}"
+MOUNTS_CONFIG="${TS_MOUNTS_CONFIG:-$CONFIG_HOME/mounts.tsv}"
 FLEET_CREDENTIALS="${TS_FLEET_CREDENTIALS:-$CONFIG_HOME/credentials.tsv}"
 FLEET_IDENTITY="${TS_FLEET_IDENTITY:-$HOME/.ssh/ts-fleet-ed25519}"
 RDP_SECRET_SERVICE="${TS_RDP_SECRET_SERVICE:-tailscale-fleet-rdp}"
@@ -2000,9 +2001,9 @@ PY
 # -----------------------------------------------------------------------------
 
 ensure_config_registry() {
-    mkdir -p "$CONFIG_HOME"
-    touch "$SSH_KEYS_CONFIG" "$FLEET_CONFIG"
-    chmod 600 "$SSH_KEYS_CONFIG" "$FLEET_CONFIG" 2>/dev/null || true
+    mkdir -p "$CONFIG_HOME" "$(dirname "$MOUNTS_CONFIG")"
+    touch "$SSH_KEYS_CONFIG" "$FLEET_CONFIG" "$MOUNTS_CONFIG"
+    chmod 600 "$SSH_KEYS_CONFIG" "$FLEET_CONFIG" "$MOUNTS_CONFIG" 2>/dev/null || true
 }
 
 validate_config_name() {
@@ -2162,6 +2163,10 @@ config_host_remove() {
     [[ $# -eq 1 ]] || die "usage: ts config host rm NAME"
     local name="$1" tmp
     fleet_record "$name" >/dev/null 2>&1 || die "unknown fleet host: $name"
+    if [[ -f "$MOUNTS_CONFIG" ]] && awk -F '|' -v n="$name" \
+        '$1 == n {found=1; exit} END {exit found ? 0 : 1}' "$MOUNTS_CONFIG"; then
+        die "fleet host '$name' still has mount definitions; remove them with ts mount rm first"
+    fi
     tmp="$(mktemp "${TMPDIR:-/tmp}/ts-fleet.XXXXXX")"
     awk -F '|' -v n="$name" '$1 != n' "$FLEET_CONFIG" > "$tmp" || true
     mv "$tmp" "$FLEET_CONFIG"
@@ -2625,22 +2630,24 @@ prune_config_backups() {
 
 config_save() {
     [[ $# -le 1 ]] || die "usage: ts config save [TARGET_DIR]"
-    local target_dir="${1:-.}" stage source destination basename changed=0
+    local target_dir="${1:-.}" stage source destination basename changed=0 index
+    local -a portable_sources=("$RDP_CONFIG" "$SSH_KEYS_CONFIG" "$FLEET_CONFIG" "$MOUNTS_CONFIG")
+    local -a portable_names=(rdp.tsv ssh-keys.tsv fleet.tsv mounts.tsv)
     [[ -d "$target_dir" ]] || die "config save target is not a directory: $target_dir"
     target_dir="$(cd "$target_dir" && pwd -P)"
+    ensure_config_registry
 
-    for source in "$RDP_CONFIG" "$SSH_KEYS_CONFIG" "$FLEET_CONFIG"; do
+    for source in "${portable_sources[@]}"; do
         [[ -f "$source" && -r "$source" ]] || die "portable config is missing or unreadable: $source"
     done
 
     stage="$(mktemp -d "$target_dir/.ts-config-save.XXXXXX")"
     trap 'rm -rf -- "$stage"' EXIT
-    for source in "$RDP_CONFIG" "$SSH_KEYS_CONFIG" "$FLEET_CONFIG"; do
-        basename="$(basename "$source")"
-        install -m 0600 "$source" "$stage/$basename"
+    for index in "${!portable_sources[@]}"; do
+        install -m 0600 "${portable_sources[$index]}" "$stage/${portable_names[$index]}"
     done
 
-    for source in "$stage/rdp.tsv" "$stage/ssh-keys.tsv" "$stage/fleet.tsv"; do
+    for source in "$stage/rdp.tsv" "$stage/ssh-keys.tsv" "$stage/fleet.tsv" "$stage/mounts.tsv"; do
         basename="$(basename "$source")"
         destination="$target_dir/$basename"
         [[ ! -L "$destination" ]] || die "refusing to replace symlinked config target: $destination"
@@ -2659,6 +2666,17 @@ config_save() {
     (( changed )) || log "config save: target already matches installed portable configuration"
     log "host-local direct mappings, bootstrap credentials, keyring secrets, and Tailscale state were not exported"
 }
+
+install_config_atomically() (
+    local source="$1" destination="$2" directory temporary
+    directory="$(dirname "$destination")"
+    mkdir -p "$directory"
+    temporary="$(mktemp "$directory/.$(basename "$destination").XXXXXX")"
+    trap 'rm -f -- "$temporary"' EXIT
+    install -m 0600 "$source" "$temporary"
+    mv -f -- "$temporary" "$destination"
+    trap - EXIT
+)
 
 config_install() {
     have python3 || die "python3 is required for config installation"
@@ -2696,7 +2714,7 @@ config_install() {
 
     # Merge/validate entirely in staging. The canonical files are untouched if
     # any name/material/address conflict is found.
-    python3 - "$source_dir" "$CONFIG_HOME" "$RDP_CONFIG" "$SSH_KEYS_CONFIG" "$FLEET_CONFIG" "$BASE" "$stage" <<'PY_CONFIG_INSTALL'
+    python3 - "$source_dir" "$CONFIG_HOME" "$RDP_CONFIG" "$SSH_KEYS_CONFIG" "$FLEET_CONFIG" "$MOUNTS_CONFIG" "$BASE" "$stage" <<'PY_CONFIG_INSTALL'
 from __future__ import annotations
 import base64
 import ipaddress
@@ -2710,8 +2728,9 @@ config_home = Path(sys.argv[2]).resolve()
 rdp_target = Path(sys.argv[3]).expanduser().resolve()
 keys_target = Path(sys.argv[4]).expanduser().resolve()
 fleet_target = Path(sys.argv[5]).expanduser().resolve()
-base = Path(sys.argv[6]).expanduser().resolve()
-stage = Path(sys.argv[7]).resolve()
+mounts_target = Path(sys.argv[6]).expanduser().resolve()
+base = Path(sys.argv[7]).expanduser().resolve()
+stage = Path(sys.argv[8]).resolve()
 stage.mkdir(parents=True, exist_ok=True)
 
 NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -2912,33 +2931,72 @@ def merge_fleet(paths: list[Path]):
     return [by_name[k] for k in sorted(by_name)]
 
 
+def normalize_mount(fields: list[str], origin: str, fleet_names: set[str]):
+    if len(fields) > 4:
+        fail(f"mount definition has more than four fields in {origin}")
+    fields = fields + [""] * (4 - len(fields))
+    machine, share, remote, user = fields[:4]
+    if not machine or not NAME_RE.fullmatch(machine) or machine in {".", ".."}:
+        fail(f"invalid mount machine {machine!r} in {origin}")
+    if machine not in fleet_names:
+        fail(f"mount {machine!r}/{share!r} refers to an unknown fleet host in {origin}")
+    if not share or not NAME_RE.fullmatch(share) or share in {".", ".."}:
+        fail(f"invalid mount share {share!r} in {origin}")
+    if not remote:
+        fail(f"mount {machine!r}/{share!r} has no remote path in {origin}")
+    return (machine, share, remote, user)
+
+
+def merge_mounts(paths: list[Path], fleet_names: set[str]):
+    by_key = {}
+    origins = {}
+    for path in paths:
+        for lineno, fields in iter_records(path):
+            origin = f"{path}:{lineno}"
+            rec = normalize_mount(fields, origin, fleet_names)
+            key = rec[:2]
+            if key in by_key and by_key[key] != rec:
+                fail(
+                    f"conflicting mount definition for {key[0]!r}/{key[1]!r}: "
+                    f"{origins[key]} vs {origin}"
+                )
+            by_key.setdefault(key, rec)
+            origins.setdefault(key, origin)
+    return [by_key[k] for k in sorted(by_key)]
+
+
 rdp_paths = source_files("rdp.tsv", rdp_target)
 key_paths = source_files("ssh-keys.tsv", keys_target)
 fleet_paths = source_files("fleet.tsv", fleet_target)
+mounts_paths = source_files("mounts.tsv", mounts_target)
 
 rdp = merge_rdp(rdp_paths)
 keys = merge_keys(key_paths)
 fleet = merge_fleet(fleet_paths)
+mounts = merge_mounts(mounts_paths, {record[0] for record in fleet})
 
 (stage / "rdp.tsv").write_text("".join("|".join(x) + "\n" for x in rdp), encoding="utf-8")
 (stage / "ssh-keys.tsv").write_text("".join("|".join(x) + "\n" for x in keys), encoding="utf-8")
 (stage / "fleet.tsv").write_text("".join("|".join(x) + "\n" for x in fleet), encoding="utf-8")
+(stage / "mounts.tsv").write_text("".join("|".join(x) + "\n" for x in mounts), encoding="utf-8")
 
 print(f"[ts] config source: {source_dir}", file=sys.stderr)
 print(f"[ts] merged RDP bindings: {len(rdp)}", file=sys.stderr)
 print(f"[ts] merged SSH login public keys: {len(keys)}", file=sys.stderr)
 print(f"[ts] merged fleet hosts: {len(fleet)}", file=sys.stderr)
-for label, paths in (("rdp", rdp_paths), ("ssh-keys", key_paths), ("fleet", fleet_paths)):
+print(f"[ts] merged fleet mounts: {len(mounts)}", file=sys.stderr)
+for label, paths in (("rdp", rdp_paths), ("ssh-keys", key_paths), ("fleet", fleet_paths), ("mounts", mounts_paths)):
     if paths:
         print(f"[ts] {label} inputs: " + ", ".join(str(p) for p in paths), file=sys.stderr)
 PY_CONFIG_INSTALL
 
-    local rdp_changed=0 keys_changed=0 fleet_changed=0
+    local rdp_changed=0 keys_changed=0 fleet_changed=0 mounts_changed=0
     [[ -f "$RDP_CONFIG" ]] && cmp -s "$RDP_CONFIG" "$stage/rdp.tsv" || rdp_changed=1
     [[ -f "$SSH_KEYS_CONFIG" ]] && cmp -s "$SSH_KEYS_CONFIG" "$stage/ssh-keys.tsv" || keys_changed=1
     [[ -f "$FLEET_CONFIG" ]] && cmp -s "$FLEET_CONFIG" "$stage/fleet.tsv" || fleet_changed=1
+    [[ -f "$MOUNTS_CONFIG" ]] && cmp -s "$MOUNTS_CONFIG" "$stage/mounts.tsv" || mounts_changed=1
 
-    if (( ! rdp_changed && ! keys_changed && ! fleet_changed )); then
+    if (( ! rdp_changed && ! keys_changed && ! fleet_changed && ! mounts_changed )); then
         (( dry_run )) || prune_config_backups
         log "config already installed and normalized; no changes"
         return 0
@@ -2949,6 +3007,7 @@ PY_CONFIG_INSTALL
         (( rdp_changed )) && log "would update: $RDP_CONFIG"
         (( keys_changed )) && log "would update: $SSH_KEYS_CONFIG"
         (( fleet_changed )) && log "would update: $FLEET_CONFIG"
+        (( mounts_changed )) && log "would update: $MOUNTS_CONFIG"
         return 0
     fi
 
@@ -2966,7 +3025,7 @@ PY_CONFIG_INSTALL
     chmod 700 "$CONFIG_HOME/backups" "$backup_dir" 2>/dev/null || true
 
     local backed_up=0 file
-    for file in "$RDP_CONFIG" "$SSH_KEYS_CONFIG" "$FLEET_CONFIG"; do
+    for file in "$RDP_CONFIG" "$SSH_KEYS_CONFIG" "$FLEET_CONFIG" "$MOUNTS_CONFIG"; do
         if [[ -f "$file" ]]; then
             cp -p -- "$file" "$backup_dir/$(basename "$file")"
             backed_up=1
@@ -2974,16 +3033,18 @@ PY_CONFIG_INSTALL
     done
     (( backed_up )) && log "backup: $backup_dir" || rmdir "$backup_dir" 2>/dev/null || true
 
-    mkdir -p "$(dirname "$RDP_CONFIG")" "$(dirname "$SSH_KEYS_CONFIG")" "$(dirname "$FLEET_CONFIG")"
-    install -m 0600 "$stage/rdp.tsv" "$RDP_CONFIG"
-    install -m 0600 "$stage/ssh-keys.tsv" "$SSH_KEYS_CONFIG"
-    install -m 0600 "$stage/fleet.tsv" "$FLEET_CONFIG"
+    mkdir -p "$(dirname "$RDP_CONFIG")" "$(dirname "$SSH_KEYS_CONFIG")" "$(dirname "$FLEET_CONFIG")" "$(dirname "$MOUNTS_CONFIG")"
+    install_config_atomically "$stage/rdp.tsv" "$RDP_CONFIG"
+    install_config_atomically "$stage/ssh-keys.tsv" "$SSH_KEYS_CONFIG"
+    install_config_atomically "$stage/fleet.tsv" "$FLEET_CONFIG"
+    install_config_atomically "$stage/mounts.tsv" "$MOUNTS_CONFIG"
     chmod 700 "$CONFIG_HOME" 2>/dev/null || true
 
     log "config installed: $CONFIG_HOME"
     (( rdp_changed )) && log "updated RDP registry: $RDP_CONFIG"
     (( keys_changed )) && log "updated SSH-key registry: $SSH_KEYS_CONFIG"
     (( fleet_changed )) && log "updated fleet registry: $FLEET_CONFIG"
+    (( mounts_changed )) && log "updated mount registry: $MOUNTS_CONFIG"
 
     if (( was_rdp_running && rdp_changed )); then
         rdp_restart
@@ -3000,6 +3061,8 @@ config_show() {
     printf 'ssh-direct-local: %s\n' "$SSH_DIRECT_CONFIG"
     printf 'credentials:      %s%s\n' "$FLEET_CREDENTIALS" "$([[ -f "$FLEET_CREDENTIALS" ]] && printf ' (present)' || printf ' (absent)')"
     printf 'fleet-registry:   %s\n' "$FLEET_CONFIG"
+    printf 'mount-registry:   %s\n' "$MOUNTS_CONFIG"
+    printf 'mount-root:       %s\n' "${TS_MOUNT_ROOT:-$HOME/tailscale-fleet}"
     printf 'controller-key:   %s%s\n' "$FLEET_IDENTITY" "$([[ -f "$FLEET_IDENTITY" ]] && printf ' (present)' || printf ' (absent)')"
     printf 'backup-retention: %s snapshots\n' "$CONFIG_BACKUP_KEEP"
 }
@@ -3014,7 +3077,7 @@ Install / migrate:
       Validation happens before changes; conflicts abort; existing files are backed up.
       Host-local rdp-direct.tsv, ssh-direct.tsv, and credentials.tsv are never imported or overwritten.
   ts config save [TARGET_DIR]
-      Export installed portable rdp.tsv, ssh-keys.tsv, and fleet.tsv. Default: current directory.
+      Export installed portable rdp.tsv, ssh-keys.tsv, fleet.tsv, and mounts.tsv. Default: current directory.
 
 Registry:
   ts config path
@@ -3085,6 +3148,638 @@ config_command() {
         check) config_check "$@" ;;
         help|-h|--help) config_usage ;;
         *) die "unknown config command: $sub" ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Managed SSHFS fleet mounts
+#
+# mounts.tsv is pipe-delimited portable configuration:
+#   machine | share | remote | ssh_user_override
+# Empty ssh_user_override inherits the login user from fleet.tsv.
+# -----------------------------------------------------------------------------
+
+ensure_mount_config() {
+    mkdir -p "$CONFIG_HOME" "$(dirname "$MOUNTS_CONFIG")"
+    touch "$MOUNTS_CONFIG"
+    chmod 600 "$MOUNTS_CONFIG" 2>/dev/null || true
+}
+
+validate_mount_identifier() {
+    local label="$1" value="$2"
+    [[ "$value" =~ ^[A-Za-z0-9._-]+$ && "$value" != "." && "$value" != ".." ]] \
+        || die "$label must match [A-Za-z0-9._-]+ and may not be '.' or '..'"
+}
+
+mount_record() {
+    local machine="$1" share="$2"
+    [[ -f "$MOUNTS_CONFIG" ]] || return 1
+    awk -F '|' -v m="$machine" -v s="$share" \
+        '$1 == m && $2 == s { print; found=1; exit } END { if (!found) exit 1 }' \
+        "$MOUNTS_CONFIG"
+}
+
+mount_add() (
+    ensure_mount_config
+    [[ $# -ge 2 ]] || die "usage: ts mount add MACHINE SHARE (--remote PATH | --drive LETTER) [--user USER]"
+    local machine="$1" share="$2" remote="" drive="" user="" user_set=0; shift 2
+    validate_mount_identifier "mount machine" "$machine"
+    validate_mount_identifier "mount share" "$share"
+
+    local fleet target fleet_user os
+    fleet="$(fleet_record "$machine" 2>/dev/null || true)"
+    [[ -n "$fleet" ]] || die "unknown fleet host '$machine'; add it with ts config host add first"
+    IFS='|' read -r _ target fleet_user os <<< "$fleet"
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --remote)
+                [[ $# -ge 2 ]] || die "--remote requires a path"
+                [[ -z "$remote" ]] || die "--remote may be supplied only once"
+                remote="$2"; shift 2 ;;
+            --drive)
+                [[ $# -ge 2 ]] || die "--drive requires one letter"
+                [[ -z "$drive" ]] || die "--drive may be supplied only once"
+                drive="$2"; shift 2 ;;
+            --user)
+                [[ $# -ge 2 ]] || die "--user requires a value"
+                user="$2"; user_set=1; shift 2 ;;
+            *) die "unknown mount add option: $1" ;;
+        esac
+    done
+
+    if [[ -n "$remote" && -n "$drive" ]] || [[ -z "$remote" && -z "$drive" ]]; then
+        die "choose exactly one of --remote or --drive"
+    fi
+    if [[ -n "$drive" ]]; then
+        [[ "$drive" =~ ^[A-Za-z]$ ]] || die "Windows drive must be one alphabetic letter"
+        remote="/${drive^^}:/"
+    fi
+    [[ -n "$remote" ]] || die "remote mount path may not be empty"
+    validate_registry_field "mount remote path" "$remote"
+    if (( user_set )); then
+        [[ -n "$user" ]] || die "--user may not be empty"
+        validate_registry_field "mount SSH user" "$user"
+    else
+        [[ -n "$fleet_user" ]] || die "fleet host '$machine' has no SSH user"
+        user=""
+    fi
+
+    local tmp sorted mounts_dir
+    mounts_dir="$(dirname "$MOUNTS_CONFIG")"
+    tmp="$(mktemp "$mounts_dir/.mounts.tsv.XXXXXX")"
+    sorted="$(mktemp "$mounts_dir/.mounts-sorted.tsv.XXXXXX")"
+    trap 'rm -f -- "$tmp" "$sorted"' EXIT
+    awk -F '|' -v m="$machine" -v s="$share" \
+        '!($1 == m && $2 == s)' "$MOUNTS_CONFIG" > "$tmp" || true
+    printf '%s|%s|%s|%s\n' "$machine" "$share" "$remote" "$user" >> "$tmp"
+    LC_ALL=C sort -t '|' -k1,1 -k2,2 "$tmp" > "$sorted"
+    chmod 600 "$sorted"
+    mv -f -- "$sorted" "$MOUNTS_CONFIG"
+    chmod 600 "$MOUNTS_CONFIG" 2>/dev/null || true
+    trap - EXIT
+    rm -f -- "$tmp"
+    log "registered mount '$machine/$share' -> $remote${user:+ (user $user)}"
+)
+
+mount_remove() (
+    ensure_mount_config
+    [[ $# -eq 2 ]] || die "usage: ts mount rm MACHINE SHARE"
+    local machine="$1" share="$2" tmp mounts_dir
+    validate_mount_identifier "mount machine" "$machine"
+    validate_mount_identifier "mount share" "$share"
+    mount_record "$machine" "$share" >/dev/null 2>&1 \
+        || die "unknown mount definition: $machine/$share"
+    if mount_state "$machine" "$share"; then
+        die "mount '$machine/$share' is active; unmount it before removing the definition"
+    fi
+    mounts_dir="$(dirname "$MOUNTS_CONFIG")"
+    tmp="$(mktemp "$mounts_dir/.mounts.tsv.XXXXXX")"
+    trap 'rm -f -- "$tmp"' EXIT
+    awk -F '|' -v m="$machine" -v s="$share" \
+        '!($1 == m && $2 == s)' "$MOUNTS_CONFIG" > "$tmp" || true
+    chmod 600 "$tmp"
+    mv -f -- "$tmp" "$MOUNTS_CONFIG"
+    trap - EXIT
+    log "removed mount definition '$machine/$share'"
+)
+
+mount_effective_user() {
+    local machine="$1" override="${2:-}" fleet
+    if [[ -n "$override" ]]; then
+        printf '%s\n' "$override"
+        return 0
+    fi
+    fleet="$(fleet_record "$machine" 2>/dev/null || true)"
+    [[ -n "$fleet" ]] || return 1
+    IFS='|' read -r _ _ override _ <<< "$fleet"
+    [[ -n "$override" ]] || return 1
+    printf '%s\n' "$override"
+}
+
+mount_list() {
+    ensure_mount_config
+    printf '%-20s %-20s %-30s %s\n' MACHINE SHARE REMOTE USER
+    local machine share remote user effective
+    while IFS='|' read -r machine share remote user _; do
+        [[ -n "$machine" && "$machine" != \#* ]] || continue
+        effective="$(mount_effective_user "$machine" "$user" 2>/dev/null || printf '<missing>')"
+        if [[ -z "$user" && "$effective" != '<missing>' ]]; then effective="$effective (fleet)"; fi
+        printf '%-20s %-20s %-30s %s\n' "$machine" "$share" "$remote" "$effective"
+    done < "$MOUNTS_CONFIG"
+}
+
+mount_local_path() {
+    local machine="$1" share="$2" root="${TS_MOUNT_ROOT:-$HOME/tailscale-fleet}"
+    validate_mount_identifier "mount machine" "$machine"
+    validate_mount_identifier "mount share" "$share"
+    [[ "$root" == /* && "$root" != *$'\n'* && "$root" != *$'\r'* ]] \
+        || die "TS_MOUNT_ROOT must be an absolute path without newline characters"
+    while [[ "$root" != / && "$root" == */ ]]; do root="${root%/}"; done
+    if [[ "$root" == / ]]; then
+        printf '/%s/%s\n' "$machine" "$share"
+    else
+        printf '%s/%s/%s\n' "$root" "$machine" "$share"
+    fi
+}
+
+mount_display_path() {
+    local path="$1"
+    if [[ "$path" == "$HOME" ]]; then
+        printf '~\n'
+    elif [[ "$path" == "$HOME/"* ]]; then
+        printf '~/%s\n' "${path#"$HOME/"}"
+    else
+        printf '%s\n' "$path"
+    fi
+}
+
+mount_fsname() {
+    printf 'tailscale-fleet/%s/%s\n' "$1" "$2"
+}
+
+mount_state_info() {
+    local path="$1"
+    if have findmnt; then
+        local output fstype source
+        output="$(findmnt -rn -M "$path" -o FSTYPE,SOURCE 2>/dev/null || true)"
+        [[ -n "$output" ]] || return 1
+        read -r fstype source _ <<< "$output"
+        [[ -n "$fstype" && -n "$source" ]] || return 1
+        printf '%s|%s\n' "$fstype" "$source"
+        return 0
+    fi
+    if [[ -r /proc/self/mountinfo ]]; then
+        awk -v wanted="$path" '
+            function unescape(v) {
+                gsub(/\\040/, " ", v); gsub(/\\011/, "\t", v)
+                gsub(/\\012/, "\n", v); gsub(/\\134/, "\\", v)
+                return v
+            }
+            {
+                target=unescape($5)
+                if (target != wanted) next
+                for (i=6; i<=NF; i++) if ($i == "-") {
+                    print $(i+1) "|" unescape($(i+2)); found=1; exit
+                }
+            }
+            END {if (!found) exit 1}
+        ' /proc/self/mountinfo
+        return
+    fi
+    if have mountpoint && mountpoint -q -- "$path"; then
+        printf 'unknown|unknown\n'
+        return 0
+    fi
+    return 1
+}
+
+# Return 0 for this fleet SSHFS mount, 1 for unmounted, and 2 when another
+# filesystem occupies the deterministic mountpoint.
+mount_state() {
+    local machine="$1" share="$2" path info fstype source expected
+    path="$(mount_local_path "$machine" "$share")"
+    expected="$(mount_fsname "$machine" "$share")"
+    if ! info="$(mount_state_info "$path")"; then return 1; fi
+    IFS='|' read -r fstype source <<< "$info"
+    if [[ "$fstype" == fuse.sshfs || "$fstype" == sshfs ]] && [[ "$source" == "$expected" ]]; then
+        return 0
+    fi
+    return 2
+}
+
+mount_unmount_tool() {
+    if have fusermount3; then printf 'fusermount3\n'
+    elif have fusermount; then printf 'fusermount\n'
+    else return 1
+    fi
+}
+
+mount_requirements() {
+    have sshfs || { log "ERROR: sshfs is required for managed mounts"; return 1; }
+    mount_unmount_tool >/dev/null \
+        || { log "ERROR: fusermount3 or compatible fusermount is required"; return 1; }
+    local fuse_device="${TS_FUSE_DEVICE:-/dev/fuse}"
+    [[ -r "$fuse_device" && -w "$fuse_device" ]] \
+        || { log "ERROR: FUSE device is not accessible: $fuse_device"; return 1; }
+}
+
+mount_proxy_cmd() {
+    local proxy_cmd
+    printf -v proxy_cmd '%q nc %%h %%p' "$(self_path)"
+    printf '%s\n' "$proxy_cmd"
+}
+
+fleet_mount_one() {
+    local machine="$1" share="$2"; shift 2
+    local record fleet target fleet_user os remote user local_path fsname proxy_cmd
+    record="$(mount_record "$machine" "$share" 2>/dev/null || true)"
+    if [[ -z "$record" ]]; then log "ERROR: unknown mount definition: $machine/$share"; return 1; fi
+    IFS='|' read -r _ _ remote user <<< "$record"
+    fleet="$(fleet_record "$machine" 2>/dev/null || true)"
+    if [[ -z "$fleet" ]]; then log "ERROR: unknown fleet host: $machine"; return 1; fi
+    IFS='|' read -r _ target fleet_user os <<< "$fleet"
+    user="${user:-$fleet_user}"
+    if [[ -z "$user" ]]; then log "ERROR: no SSH user configured for fleet host '$machine'"; return 1; fi
+
+    local_path="$(mount_local_path "$machine" "$share")"
+    fsname="$(mount_fsname "$machine" "$share")"
+    if mount_state "$machine" "$share"; then
+        log "mount already active: $machine/$share -> $(mount_display_path "$local_path")"
+        return 0
+    else
+        local state_rc=$?
+        if (( state_rc == 2 )); then
+            log "ERROR: mountpoint is occupied by an incompatible filesystem: $local_path"
+            return 1
+        fi
+    fi
+
+    mkdir -p -- "$local_path"
+    [[ -d "$local_path" && ! -L "$local_path" ]] \
+        || { log "ERROR: mountpoint is not a normal directory: $local_path"; return 1; }
+    proxy_cmd="$(mount_proxy_cmd)"
+    local -a command=(
+        sshfs "$user@$target:$remote" "$local_path"
+        -o "ProxyCommand=$proxy_cmd"
+        -o reconnect
+        -o ServerAliveInterval=15
+        -o ServerAliveCountMax=3
+        -o StrictHostKeyChecking=accept-new
+        -o "fsname=$fsname"
+    )
+    [[ -f "$FLEET_IDENTITY" ]] && command+=(-o "IdentityFile=$FLEET_IDENTITY")
+    command+=("$@")
+    log "mounting $machine/$share -> $(mount_display_path "$local_path")"
+    if "${command[@]}"; then
+        log "mounted $machine/$share"
+        return 0
+    else
+        local rc=$?
+        log "ERROR: mount failed for $machine/$share (sshfs exit $rc)"
+        return "$rc"
+    fi
+}
+
+mount_selected_records() {
+    local machine="${1:-}" share="${2:-}"
+    ensure_mount_config
+    if [[ -z "$machine" ]]; then
+        awk -F '|' '!/^[[:space:]]*(#|$)/ && NF >= 3 {print}' "$MOUNTS_CONFIG"
+    elif [[ -z "$share" ]]; then
+        awk -F '|' -v m="$machine" '!/^[[:space:]]*(#|$)/ && $1 == m && NF >= 3 {print}' "$MOUNTS_CONFIG"
+    else
+        mount_record "$machine" "$share"
+    fi
+}
+
+mount_runtime() {
+    [[ $# -ge 1 ]] || die "usage: ts mount MACHINE SHARE [-- SSHFS_ARGS...] | ts mount [MACHINE] --all"
+    local selector="$1" machine="" share=""; shift
+    local -a extra=() records=()
+    if [[ "$selector" == --all ]]; then
+        [[ $# -eq 0 || "$1" == -- ]] || die "unexpected mount argument: $1"
+        [[ $# -eq 0 ]] || shift
+    else
+        machine="$selector"
+        validate_mount_identifier "mount machine" "$machine"
+        [[ $# -ge 1 ]] || die "usage: ts mount MACHINE SHARE|--all"
+        share="$1"; shift
+        if [[ "$share" == --all ]]; then
+            share=""
+        else
+            validate_mount_identifier "mount share" "$share"
+        fi
+        [[ $# -eq 0 || "$1" == -- ]] || die "SSHFS arguments must follow --"
+        [[ $# -eq 0 ]] || shift
+    fi
+    extra=("$@")
+    mapfile -t records < <(mount_selected_records "$machine" "$share" 2>/dev/null || true)
+    (( ${#records[@]} )) || die "no configured mounts match the request"
+    mount_requirements || return 1
+    local record rec_machine rec_share _remote _user rc=0
+    for record in "${records[@]}"; do
+        IFS='|' read -r rec_machine rec_share _remote _user <<< "$record"
+        if ! fleet_mount_one "$rec_machine" "$rec_share" "${extra[@]}"; then rc=1; fi
+    done
+    return "$rc"
+}
+
+fleet_unmount_one() {
+    local machine="$1" share="$2" local_path tool
+    local_path="$(mount_local_path "$machine" "$share")"
+    if mount_state "$machine" "$share"; then
+        :
+    else
+        local state_rc=$?
+        if (( state_rc == 1 )); then
+            log "mount already inactive: $machine/$share"
+            return 0
+        fi
+        log "ERROR: refusing to unmount incompatible filesystem at $local_path"
+        return 1
+    fi
+    tool="$(mount_unmount_tool 2>/dev/null || true)"
+    [[ -n "$tool" ]] || { log "ERROR: fusermount3 or compatible fusermount is required"; return 1; }
+    log "unmounting $machine/$share"
+    if "$tool" -u -- "$local_path"; then
+        if mount_state "$machine" "$share"; then
+            log "ERROR: filesystem still mounted at $local_path"
+            return 1
+        fi
+        log "unmounted $machine/$share"
+        return 0
+    else
+        local rc=$?
+        log "ERROR: unmount failed for $machine/$share ($tool exit $rc)"
+        return "$rc"
+    fi
+}
+
+unmount_command() {
+    [[ $# -ge 1 ]] || die "usage: ts unmount MACHINE SHARE | ts unmount [MACHINE] --all"
+    local selector="$1" machine="" share=""; shift
+    if [[ "$selector" == --all ]]; then
+        [[ $# -eq 0 ]] || die "ts unmount --all takes no additional arguments"
+    else
+        machine="$selector"
+        validate_mount_identifier "mount machine" "$machine"
+        [[ $# -eq 1 ]] || die "usage: ts unmount MACHINE SHARE|--all"
+        share="$1"
+        if [[ "$share" == --all ]]; then share=""; else validate_mount_identifier "mount share" "$share"; fi
+    fi
+    local -a records=()
+    mapfile -t records < <(mount_selected_records "$machine" "$share" 2>/dev/null || true)
+    (( ${#records[@]} )) || die "no configured mounts match the request"
+    local record rec_machine rec_share _remote _user rc=0
+    for record in "${records[@]}"; do
+        IFS='|' read -r rec_machine rec_share _remote _user <<< "$record"
+        if ! fleet_unmount_one "$rec_machine" "$rec_share"; then rc=1; fi
+    done
+    return "$rc"
+}
+
+mounts_runtime_list() {
+    ensure_mount_config
+    printf '%-20s %-20s %-24s %-48s %s\n' MACHINE SHARE REMOTE LOCAL STATE
+    local machine share remote user local_path state
+    while IFS='|' read -r machine share remote user _; do
+        [[ -n "$machine" && "$machine" != \#* ]] || continue
+        local_path="$(mount_local_path "$machine" "$share")"
+        if mount_state "$machine" "$share"; then state=mounted
+        else
+            case $? in 1) state=unmounted ;; *) state=occupied ;; esac
+        fi
+        printf '%-20s %-20s %-24s %-48s %s\n' \
+            "$machine" "$share" "$remote" "$(mount_display_path "$local_path")" "$state"
+    done < "$MOUNTS_CONFIG"
+}
+
+mount_configured_count() {
+    ensure_mount_config
+    awk '!/^[[:space:]]*(#|$)/ {count++} END {print count+0}' "$MOUNTS_CONFIG"
+}
+
+mount_active_count() {
+    ensure_mount_config
+    local machine share remote user count=0
+    while IFS='|' read -r machine share remote user _; do
+        [[ -n "$machine" && "$machine" != \#* ]] || continue
+        if mount_state "$machine" "$share"; then count=$((count + 1)); fi
+    done < "$MOUNTS_CONFIG"
+    printf '%s\n' "$count"
+}
+
+mount_command() {
+    local action="${1:-help}"
+    case "$action" in
+        add) shift; mount_add "$@" ;;
+        rm|remove|del|delete) shift; mount_remove "$@" ;;
+        list|ls) shift; [[ $# -eq 0 ]] || die "ts mount list takes no arguments"; mount_list ;;
+        help|-h|--help)
+            cat <<'EOF_MOUNT'
+Usage:
+  ts mount add MACHINE SHARE (--remote PATH | --drive LETTER) [--user USER]
+  ts mount rm MACHINE SHARE
+  ts mount list
+  ts mount MACHINE SHARE [-- SSHFS_ARGS...]
+  ts mount MACHINE --all [-- SSHFS_ARGS...]
+  ts mount --all [-- SSHFS_ARGS...]
+  ts mounts
+  ts unmount MACHINE SHARE
+  ts unmount MACHINE --all
+  ts unmount --all
+EOF_MOUNT
+            ;;
+        *) mount_runtime "$@" ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Remote Windows ACL administration over the fleet SSH/Tailscale transport.
+# User-controlled paths are UTF-8/base64 data inside a quoted PowerShell script;
+# the complete script is then UTF-16LE/base64 for -EncodedCommand.
+# -----------------------------------------------------------------------------
+
+windows_remote_to_native() {
+    local remote="$1" drive suffix
+    if [[ "$remote" =~ ^/([A-Za-z]):/(.*)$ ]]; then
+        drive="${BASH_REMATCH[1]^^}"
+        suffix="${BASH_REMATCH[2]}"
+        suffix="${suffix//\//\\}"
+        printf '%s:\\%s\n' "$drive" "$suffix"
+        return 0
+    fi
+    return 1
+}
+
+acl_resolve_path() {
+    local machine="$1" requested="$2" record remote
+    if [[ "$requested" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        record="$(mount_record "$machine" "$requested" 2>/dev/null || true)"
+        if [[ -n "$record" ]]; then
+            IFS='|' read -r _ _ remote _ <<< "$record"
+            windows_remote_to_native "$remote" \
+                || die "mount '$machine/$requested' cannot be converted to a Windows path; provide a native Windows path explicitly"
+            return 0
+        fi
+    fi
+    [[ -n "$requested" && "$requested" != *$'\n'* && "$requested" != *$'\r'* ]] \
+        || die "Windows ACL path may not be empty or contain newline characters"
+    printf '%s\n' "$requested"
+}
+
+utf8_base64() {
+    have python3 || die "python3 is required for Windows ACL operations"
+    python3 - "$1" <<'PY_UTF8_BASE64'
+import base64
+import sys
+print(base64.b64encode(sys.argv[1].encode("utf-8")).decode("ascii"))
+PY_UTF8_BASE64
+}
+
+acl_write_powershell() {
+    local script="$1" operation="$2" windows_path="$3" take_ownership="$4" path_payload
+    path_payload="$(utf8_base64 "$windows_path")"
+    {
+        printf "\$pathPayload = '%s'\n" "$path_payload"
+        printf "\$operation = '%s'\n" "$operation"
+        if (( take_ownership )); then
+            printf '$takeOwnership = $true\n'
+        else
+            printf '$takeOwnership = $false\n'
+        fi
+        cat <<'EOF_ACL_POWERSHELL'
+$ErrorActionPreference = 'Stop'
+$pathBytes = [Convert]::FromBase64String($pathPayload)
+$path = [Text.Encoding]::UTF8.GetString($pathBytes)
+# PowerShell backtick escapes such as `r and `n remain literal in this quoted source.
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$sid = $identity.User.Value
+$account = $identity.Name
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+$isAdmin = $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not (Test-Path -LiteralPath $path)) {
+    [Console]::Error.WriteLine("[ts] ERROR: Windows path does not exist: $path")
+    exit 2
+}
+
+if ($operation -eq 'show') {
+    & icacls.exe $path
+    $aclExit = $LASTEXITCODE
+    if ($aclExit -ne 0) {
+        [Console]::Error.WriteLine("[ts] ERROR: icacls inspection failed with exit code $aclExit")
+    }
+    exit $aclExit
+}
+
+if (-not $isAdmin) {
+    [Console]::Error.WriteLine('[ts] ERROR: remote Windows SSH session is not elevated')
+    [Console]::Error.WriteLine("[ts] host: $env:COMPUTERNAME")
+    [Console]::Error.WriteLine("[ts] account: $account")
+    [Console]::Error.WriteLine("[ts] cannot modify ACL for $path")
+    [Console]::Error.WriteLine('[ts] Windows remote-token filtering may be the cause; UAC and security policy were not changed')
+    exit 5
+}
+
+if ($takeOwnership) {
+    Write-Output "[ts] taking ownership as $account for $path"
+    & takeown.exe /F $path /R /D Y
+    $takeownExit = $LASTEXITCODE
+    if ($takeownExit -ne 0) {
+        [Console]::Error.WriteLine("[ts] ERROR: takeown failed with exit code $takeownExit")
+        exit $takeownExit
+    }
+    Write-Output "[ts] ownership changed for $path"
+}
+
+# Prefixing a numeric SID with '*' is the form icacls requires. /grant:r
+# replaces this principal's explicit grant while preserving every unrelated ACE.
+$grant = "*$($sid):(OI)(CI)F"
+& icacls.exe $path /grant:r $grant /T /C
+$aclExit = $LASTEXITCODE
+if ($aclExit -ne 0) {
+    [Console]::Error.WriteLine("[ts] ERROR: icacls reported failures (exit code $aclExit) for $path")
+    exit $aclExit
+}
+Write-Output "[ts] granted Full Control to $account ($sid) for $path"
+EOF_ACL_POWERSHELL
+    } > "$script"
+    chmod 600 "$script"
+}
+
+acl_run() {
+    local operation="$1" machine="$2" requested="$3" take_ownership="${4:-0}" system_drive="${5:-0}"
+    local fleet target user os windows_path script encoded rc alias_record alias_user
+    fleet="$(fleet_record "$machine" 2>/dev/null || true)"
+    [[ -n "$fleet" ]] || die "unknown fleet host: $machine"
+    IFS='|' read -r _ target user os <<< "$fleet"
+    [[ "$os" == windows ]] || die "Windows ACL commands require a windows fleet host; '$machine' is '$os'"
+    [[ -n "$user" ]] || die "fleet host '$machine' has no SSH user"
+    if [[ "$requested" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        alias_record="$(mount_record "$machine" "$requested" 2>/dev/null || true)"
+        if [[ -n "$alias_record" ]]; then
+            IFS='|' read -r _ _ _ alias_user <<< "$alias_record"
+            user="${alias_user:-$user}"
+        fi
+    fi
+    windows_path="$(acl_resolve_path "$machine" "$requested")"
+
+    if [[ "$operation" == grant && "$windows_path" =~ ^[Cc]:[\\/]$ ]] && (( ! system_drive )); then
+        die "refusing recursive Full Control grant on C:\\; repeat with --system-drive to acknowledge the whole system drive"
+    fi
+
+    script="$(mktemp "${TMPDIR:-/tmp}/ts-acl.XXXXXX.ps1")"
+    acl_write_powershell "$script" "$operation" "$windows_path" "$take_ownership"
+    encoded="$(powershell_encode_file "$script")"
+    local -a ssh_cmd
+    fleet_ssh_base ssh_cmd
+    log "Windows ACL $operation -> $machine ($user@$target): $windows_path"
+    if "${ssh_cmd[@]}" -o BatchMode=yes -l "$user" "$target" \
+        "powershell.exe -NoProfile -NonInteractive -OutputFormat Text -ExecutionPolicy Bypass -EncodedCommand $encoded"; then
+        rm -f -- "$script"
+        return 0
+    else
+        rc=$?
+        rm -f -- "$script"
+        log "ERROR: Windows ACL $operation failed for '$machine' path '$windows_path' (SSH/remote exit $rc)"
+        return "$rc"
+    fi
+}
+
+acl_command() {
+    local action="${1:-help}"; shift || true
+    case "$action" in
+        show)
+            [[ $# -eq 2 ]] || die "usage: ts acl show MACHINE PATH_OR_SHARE"
+            validate_mount_identifier "fleet machine" "$1"
+            acl_run show "$1" "$2" 0 0 ;;
+        grant)
+            [[ $# -ge 2 ]] || die "usage: ts acl grant MACHINE PATH_OR_SHARE [--take-ownership] [--system-drive]"
+            local machine="$1" requested="$2" take_ownership=0 system_drive=0; shift 2
+            validate_mount_identifier "fleet machine" "$machine"
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --take-ownership) take_ownership=1 ;;
+                    --system-drive) system_drive=1 ;;
+                    *) die "unknown acl grant option: $1" ;;
+                esac
+                shift
+            done
+            acl_run grant "$machine" "$requested" "$take_ownership" "$system_drive" ;;
+        help|-h|--help)
+            cat <<'EOF_ACL'
+Usage:
+  ts acl show MACHINE PATH_OR_SHARE
+  ts acl grant MACHINE PATH_OR_SHARE [--take-ownership] [--system-drive]
+
+Grant uses the current remote SSH security principal's numeric SID and preserves
+unrelated ACL entries. --take-ownership is invasive. --system-drive is required
+for an exact C:\ root grant. The two acknowledgements are independent.
+EOF_ACL
+            ;;
+        *) die "unknown ACL command: $action" ;;
     esac
 }
 
@@ -3352,6 +4047,21 @@ doctor() {
     fi
     if have vmrun; then printf '%-22s %s\n' vmrun available; else printf '%-22s %s\n' vmrun unavailable; fi
     printf '%-22s %s\n' direct-rdp-mappings "$(rdp_direct_count)"
+    if have sshfs; then printf '%-22s %s\n' sshfs available; else printf '%-22s %s\n' sshfs unavailable; fi
+    if have fusermount3; then
+        printf '%-22s %s\n' fusermount3 available
+    elif have fusermount; then
+        printf '%-22s %s\n' fusermount3 'compatible fusermount available'
+    else
+        printf '%-22s %s\n' fusermount3 unavailable
+    fi
+    if [[ -r "${TS_FUSE_DEVICE:-/dev/fuse}" && -w "${TS_FUSE_DEVICE:-/dev/fuse}" ]]; then
+        printf '%-22s %s\n' /dev/fuse accessible
+    else
+        printf '%-22s %s\n' /dev/fuse unavailable
+    fi
+    printf '%-22s %s\n' configured-mounts "$(mount_configured_count)"
+    printf '%-22s %s\n' active-fleet-mounts "$(mount_active_count)"
 
     if rdp_has_bindings; then
         printf '%-22s %s\n' rdp-bindings "$(grep -cEv '^[[:space:]]*(#|$)' "$RDP_CONFIG")"
@@ -3360,12 +4070,9 @@ doctor() {
         printf '%-22s %s\n' rdp-bindings 0
     fi
     ensure_config_registry
-    printf '%-22s %s
-' ssh-keys "$(grep -cEv '^[[:space:]]*(#|$)' "$SSH_KEYS_CONFIG" 2>/dev/null || printf 0)"
-    printf '%-22s %s
-' fleet-hosts "$(grep -cEv '^[[:space:]]*(#|$)' "$FLEET_CONFIG" 2>/dev/null || printf 0)"
-    printf '%-22s %s
-' controller-key "$([[ -f "$FLEET_IDENTITY" ]] && printf OK || printf ABSENT)"
+    printf '%-22s %s\n' ssh-keys "$(grep -cEv '^[[:space:]]*(#|$)' "$SSH_KEYS_CONFIG" 2>/dev/null || printf 0)"
+    printf '%-22s %s\n' fleet-hosts "$(grep -cEv '^[[:space:]]*(#|$)' "$FLEET_CONFIG" 2>/dev/null || printf 0)"
+    printf '%-22s %s\n' controller-key "$([[ -f "$FLEET_IDENTITY" ]] && printf OK || printf ABSENT)"
     return "$rc"
 }
 
@@ -3387,6 +4094,10 @@ Core:
   ts nc HOST PORT           Native Tailscale netcat (passthrough)
   ts ssh [ARGS] DEST        OpenSSH through 'tailscale nc' as ProxyCommand
   ts ssh NAME --direct      Lazy direct SSH to a locally managed VM
+  ts mount ...              Define or activate managed SSHFS fleet mounts
+  ts mounts                 Show configured mounts and actual runtime state
+  ts unmount ...            Unmount managed fleet SSHFS filesystems
+  ts acl ...                Inspect/grant remote Windows filesystem ACLs
   ts config ...             Fleet/key registry and authorization propagation
   ts config install [--from DIR]  Merge/migrate repo config into ~/.config/ts
   ts config save [TARGET_DIR]     Export portable config (default: current directory)
@@ -3422,6 +4133,23 @@ Fleet configuration:
   ts config check HOST|--all
   ts config help
 
+Managed filesystems:
+  ts mount add MACHINE SHARE --remote PATH [--user USER]
+  ts mount add MACHINE SHARE --drive LETTER [--user USER]
+  ts mount rm MACHINE SHARE
+  ts mount list
+  ts mount MACHINE SHARE [-- SSHFS_ARGS...]
+  ts mount MACHINE --all
+  ts mount --all
+  ts mounts
+  ts unmount MACHINE SHARE
+  ts unmount MACHINE --all
+  ts unmount --all
+
+Remote Windows ACLs:
+  ts acl show MACHINE PATH_OR_SHARE
+  ts acl grant MACHINE PATH_OR_SHARE [--take-ownership] [--system-drive]
+
 Install/update:
   ts self-install           Copy this CLI to ~/.local/bin/ts
   ts install [VERSION]      Install Tailscale static binaries
@@ -3446,6 +4174,8 @@ Environment:
   TS_SSH_DIRECT_CONFIG       alternate host-local direct SSH registry path
   TS_FLEET_CREDENTIALS       bootstrap password file (default: ~/.config/ts/credentials.tsv)
   TS_FLEET_CONFIG            alternate fleet host registry path
+  TS_MOUNTS_CONFIG           alternate portable mount registry path
+  TS_MOUNT_ROOT              fleet mount root (default: ~/tailscale-fleet)
   TS_FLEET_IDENTITY          controller private key (default: ~/.ssh/ts-fleet-ed25519)
   TS_CONFIG_BACKUP_KEEP      retained config-install snapshots (default: 5)
 EOF_USAGE
@@ -3502,6 +4232,19 @@ main() {
             ;;
         config)
             config_command "$@"
+            ;;
+        mount)
+            mount_command "$@"
+            ;;
+        mounts)
+            [[ $# -eq 0 ]] || die "ts mounts takes no arguments"
+            mounts_runtime_list
+            ;;
+        unmount)
+            unmount_command "$@"
+            ;;
+        acl)
+            acl_command "$@"
             ;;
         ssh)
             ts_ssh "$@"

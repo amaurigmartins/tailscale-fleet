@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -eu
+
+: "${MOCK_MOUNT_STATE:?}"
+mountpoint=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -M|--mountpoint)
+            mountpoint="${2:-}"
+            shift 2 ;;
+        *) shift ;;
+    esac
+done
+[[ -n "$mountpoint" ]] || exit 2
+awk -F '|' -v wanted="$mountpoint" '
+    $1 == wanted {print $2 " " $3; found=1; exit}
+    END {if (!found) exit 1}
+' "$MOCK_MOUNT_STATE"

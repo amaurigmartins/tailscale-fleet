@@ -3,3 +3,10 @@ set -eu
 
 : "${MOCK_SSH_LOG:?}"
 printf '%s\n' "$@" > "$MOCK_SSH_LOG"
+if [[ "${MOCK_SSH_MODE:-}" == acl-unelevated ]]; then
+    printf '%s\n' \
+        '[ts] ERROR: remote Windows SSH session is not elevated' \
+        '[ts] account: TESTHOST\Alice' \
+        '[ts] cannot modify ACL for D:\' >&2
+    exit 5
+fi
