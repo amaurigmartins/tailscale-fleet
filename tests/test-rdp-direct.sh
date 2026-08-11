@@ -54,9 +54,10 @@ run_launch() {
 }
 
 "$TS" rdp add windows windows.tail.example --user Alice --server-name windows-cert >/dev/null
+assert_contains "$XDG_CONFIG_HOME/ts/rdp.tsv" '# NAME_OR_ALIAS|HOSTNAME|LOCAL_IP|USERNAME|PORT|SERVER_NAME|RDP_ARGS_B64'
 
 "$TS" rdp direct set windows --address 127.0.0.1 --port 13389 >/dev/null
-run_launch windows --direct -- /f
+run_launch windows.tail.example --direct -- /f
 assert_contains "$MOCK_FREERDP_LOG" '/v:127.0.0.1:13389'
 assert_contains "$MOCK_FREERDP_LOG" '/server-name:windows-cert'
 assert_contains "$MOCK_FREERDP_LOG" '/title:FreeRDP: tailscale-fleet windows'
@@ -66,7 +67,7 @@ assert_contains "$MOCK_FREERDP_LOG" '/title:Custom RDP session'
 if grep -Fqx -- '/title:FreeRDP: tailscale-fleet windows' "$MOCK_FREERDP_LOG"; then
     fail 'explicit FreeRDP title did not replace the default title'
 fi
-pass 'static direct endpoint launches FreeRDP with an overridable machine title'
+pass 'hostname and alias resolve to one RDP binding whose title prefers the alias'
 
 printf 'alice-password\nalice-password\n' | "$TS" rdp credential set windows >/dev/null
 printf 'bob-password\nbob-password\n' | "$TS" rdp credential set windows --user Bob >/dev/null

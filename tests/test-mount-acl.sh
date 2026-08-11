@@ -45,15 +45,20 @@ expect_failure() {
 "$TS" config host add win win.tail.example --user Alice --os windows >/dev/null
 "$TS" config host add linux linux.tail.example --user Lin --os linux >/dev/null
 "$TS" mount add linux home --remote /home/Lin >/dev/null
-"$TS" mount add win drive_d --drive d >/dev/null
+"$TS" mount add win.tail.example drive_d --drive d >/dev/null
 "$TS" mount add win projects --remote /D:/Projects --user ProjectUser >/dev/null
+assert_line "$XDG_CONFIG_HOME/ts/fleet.tsv" '# NAME_OR_ALIAS|HOSTNAME|SSH_USER|OS'
+assert_line "$XDG_CONFIG_HOME/ts/mounts.tsv" '# NAME_OR_ALIAS|SHARE|REMOTE_PATH|SSH_USER_OVERRIDE'
 assert_line "$XDG_CONFIG_HOME/ts/mounts.tsv" 'linux|home|/home/Lin|'
 assert_line "$XDG_CONFIG_HOME/ts/mounts.tsv" 'win|drive_d|/D:/|'
 assert_line "$XDG_CONFIG_HOME/ts/mounts.tsv" 'win|projects|/D:/Projects|ProjectUser'
+resolved_tokens="$(bash -c 'source "$1"; fleet_resolve_token win; fleet_resolve_token Alice@win:/D:/Projects' bash "$TS")"
+[[ "$resolved_tokens" == $'win.tail.example\nAlice@win.tail.example:/D:/Projects' ]] \
+    || fail "hostname resolution did not preserve SSH/file token syntax: $resolved_tokens"
 list_output="$("$TS" mount list)"
 assert_contains "$list_output" 'Alice (fleet)'
 assert_contains "$list_output" 'ProjectUser'
-pass 'mount registry adds generic paths, drive shorthand, inherited users, and overrides'
+pass 'fleet aliases resolve to hostnames while mounts retain the preferred name'
 
 "$TS" mount add win drive_d --remote /D:/Updated >/dev/null
 [[ "$(awk -F '|' '$1 == "win" && $2 == "drive_d" {count++} END {print count+0}' "$XDG_CONFIG_HOME/ts/mounts.tsv")" -eq 1 ]] \
@@ -74,6 +79,11 @@ actual_derived="$(bash -c 'source "$1"; TS_MOUNT_ROOT=/tmp/fleet; mount_actual_p
 [[ "$actual_derived" == '/tmp/fleet/host1/drive_d on host1' ]] \
     || fail "unexpected Files-facing mount path: $actual_derived"
 pass 'canonical and Files-facing mountpoint derivation is deterministic'
+
+default_derived="$(env -u TS_MOUNT_ROOT bash -c 'source "$1"; mount_local_path host1 drive_d' bash "$TS")"
+[[ "$default_derived" == "$HOME/.local/mnt/host1/drive_d" ]] \
+    || fail "unexpected default mount root: $default_derived"
+pass 'default mount root is ~/.local/mnt'
 
 : > "$MOCK_SSHFS_LOG"
 : > "$MOCK_MOUNT_STATE"
@@ -158,13 +168,16 @@ INSTALL_ROOT="$TEST_ROOT/install-case"
 mkdir -p "$INSTALL_ROOT/home" "$INSTALL_ROOT/old-source" "$INSTALL_ROOT/new-source" "$INSTALL_ROOT/conflict-source"
 for source in old-source new-source conflict-source; do
     touch "$INSTALL_ROOT/$source/rdp.tsv" "$INSTALL_ROOT/$source/ssh-keys.tsv"
-    printf 'host1|host1.tail|User1|windows\n' > "$INSTALL_ROOT/$source/fleet.tsv"
+    printf 'host1.tail|host1.tail|User1|windows\n' > "$INSTALL_ROOT/$source/fleet.tsv"
 done
+printf 'alias1|host1.tail|User1|windows\n' > "$INSTALL_ROOT/new-source/fleet.tsv"
+printf 'alias1|host1.tail|User1|windows\n' > "$INSTALL_ROOT/conflict-source/fleet.tsv"
 HOME="$INSTALL_ROOT/home" XDG_CONFIG_HOME="$INSTALL_ROOT/config" TAILSCALE_USER_HOME="$INSTALL_ROOT/state" \
     "$TS" config install --from "$INSTALL_ROOT/old-source" >/dev/null
-[[ -f "$INSTALL_ROOT/config/ts/mounts.tsv" && ! -s "$INSTALL_ROOT/config/ts/mounts.tsv" ]] \
-    || fail 'old installation without mounts.tsv was not normalized to an empty registry'
-printf 'host1|drive_d|/D:/|\n' > "$INSTALL_ROOT/new-source/mounts.tsv"
+assert_line "$INSTALL_ROOT/config/ts/mounts.tsv" '# NAME_OR_ALIAS|SHARE|REMOTE_PATH|SSH_USER_OVERRIDE'
+[[ "$(grep -cEv '^[[:space:]]*(#|$)' "$INSTALL_ROOT/config/ts/mounts.tsv")" -eq 0 ]] \
+    || fail 'old installation without mounts.tsv was not normalized to a header-only registry'
+printf 'host1.tail|drive_d|/D:/|\n' > "$INSTALL_ROOT/new-source/mounts.tsv"
 printf '%s|fuse.sshfs|%s\n' \
     "$TS_MOUNT_ROOT/win/drive_d" 'tailscale-fleet/win/drive_d' > "$MOCK_MOUNT_STATE"
 mount_state_before="$(cat "$MOCK_MOUNT_STATE")"
@@ -172,7 +185,8 @@ HOME="$INSTALL_ROOT/home" XDG_CONFIG_HOME="$INSTALL_ROOT/config" TAILSCALE_USER_
     "$TS" config install --from "$INSTALL_ROOT/new-source" >/dev/null
 [[ "$(cat "$MOCK_MOUNT_STATE")" == "$mount_state_before" ]] \
     || fail 'config install altered active mount runtime state'
-assert_line "$INSTALL_ROOT/config/ts/mounts.tsv" 'host1|drive_d|/D:/|'
+assert_line "$INSTALL_ROOT/config/ts/fleet.tsv" 'alias1|host1.tail|User1|windows'
+assert_line "$INSTALL_ROOT/config/ts/mounts.tsv" 'alias1|drive_d|/D:/|'
 backup_count="$(find "$INSTALL_ROOT/config/ts/backups" -mindepth 1 -maxdepth 1 -type d | wc -l)"
 [[ "$backup_count" -ge 1 ]] || fail 'config install did not back up existing portable config'
 backup_mount="$(find "$INSTALL_ROOT/config/ts/backups" -mindepth 2 -maxdepth 2 -name mounts.tsv | head -n 1)"
@@ -181,7 +195,7 @@ HOME="$INSTALL_ROOT/home" XDG_CONFIG_HOME="$INSTALL_ROOT/config" TAILSCALE_USER_
     "$TS" config install --from "$INSTALL_ROOT/new-source" >/dev/null
 [[ "$(find "$INSTALL_ROOT/config/ts/backups" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq "$backup_count" ]] \
     || fail 'idempotent config install created an unnecessary backup'
-printf 'host1|drive_d|/E:/|\n' > "$INSTALL_ROOT/conflict-source/mounts.tsv"
+printf 'host1.tail|drive_d|/E:/|\n' > "$INSTALL_ROOT/conflict-source/mounts.tsv"
 expect_failure "$TEST_ROOT/config-conflict" env \
     HOME="$INSTALL_ROOT/home" XDG_CONFIG_HOME="$INSTALL_ROOT/config" TAILSCALE_USER_HOME="$INSTALL_ROOT/state" \
     "$TS" config install --from "$INSTALL_ROOT/conflict-source"

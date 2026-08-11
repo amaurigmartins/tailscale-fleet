@@ -39,7 +39,7 @@ Rocky / rootless Linux
         +---- Tailscale Serve :22 <--------------- fleet return SSH
         |
         +---- SSHFS/FUSE ------------------------> fleet host SFTP
-        |       +-- ~/tailscale-fleet/MACHINE/SHARE on MACHINE
+        |       +-- ~/.local/mnt/ALIAS/SHARE on ALIAS
         |       +-- stable SHARE symlink -> SHARE on MACHINE
         |       +-- ProxyCommand: ts nc HOST 22
         |
@@ -290,7 +290,7 @@ Normal case:
 ts rdp add badasspc --user Username
 ```
 
-`TARGET` defaults to `NAME`.
+`HOSTNAME` defaults to `NAME_OR_ALIAS`, which is the no-alias form.
 
 Another machine (note the nonsensical `DOMAIN-NAME` quirk of Windows RDP):
 
@@ -328,11 +328,11 @@ Useful options:
 Defaults:
 
 ```text
-TARGET       = NAME
+HOSTNAME     = NAME_OR_ALIAS
 local IP     = first free 127.77.0.x
 local port   = 3389
 remote port  = 3389
-server name  = TARGET
+server name  = HOSTNAME
 ```
 
 MagicDNS machine names are preferred over hard-coded Tailscale IPs.
@@ -352,10 +352,17 @@ ts rdp hostname-vmware
 /title:FreeRDP: tailscale-fleet MACHINE
 ```
 
+The portable RDP registry uses the same explicit naming rule:
+
+```text
+# NAME_OR_ALIAS|HOSTNAME|LOCAL_IP|USERNAME|PORT|SERVER_NAME|RDP_ARGS_B64
+```
+
 Yes, **clipboard redirection is enabled by default**. This project refuses to accept a world where a VM/remote-desktop stack cannot reliably move text from Ctrl+C to Ctrl+V across two computers. We put humans on the fucking Moon.
 
-The window title uses the configured `ts` machine name rather than the bridge
-or direct endpoint IP. Override it for one launch with, for example:
+The window title uses the binding's preferred name: its alias when configured,
+otherwise its hostname. Both names resolve to the same binding. Override the
+title for one launch with, for example:
 
 ```bash
 ts rdp badasspc -- '/title:Custom RDP session'
@@ -645,7 +652,7 @@ one. Its SFTP connection uses the same OpenSSH `ProxyCommand` transport as
 ```text
 ROOTLESS CONTROLLER
 
-~/tailscale-fleet/
+~/.local/mnt/
 ├── windows-box/
 │   ├── drive_c -> drive_c on windows-box/
 │   ├── drive_c on windows-box/        # FUSE mount shown by Files
@@ -692,7 +699,7 @@ Ctrl+C/Ctrl+V.
 `~/.config/ts/mounts.tsv` is portable declarative configuration:
 
 ```text
-MACHINE|SHARE|REMOTE|USER
+# NAME_OR_ALIAS|SHARE|REMOTE_PATH|SSH_USER_OVERRIDE
 windows-box|drive_c|/C:/|
 windows-box|drive_d|/D:/|User
 linux-box|home|/home/user|
@@ -704,13 +711,14 @@ must already exist there because its target, user, and OS metadata are part of
 the transport. Both local paths are derived rather than stored:
 
 ```text
-stable path:      ${TS_MOUNT_ROOT:-$HOME/tailscale-fleet}/MACHINE/SHARE
-FUSE mountpoint:  ${TS_MOUNT_ROOT:-$HOME/tailscale-fleet}/MACHINE/SHARE on MACHINE
+stable path:      ${TS_MOUNT_ROOT:-$HOME/.local/mnt}/NAME_OR_ALIAS/SHARE
+FUSE mountpoint:  ${TS_MOUNT_ROOT:-$HOME/.local/mnt}/NAME_OR_ALIAS/SHARE on NAME_OR_ALIAS
 ```
 
 GNOME Files derives a local FUSE mount's sidebar name from the mountpoint
-basename, so the real mountpoint produces names such as `drive_c on
-windows-box`. The original `MACHINE/SHARE` path is retained as a relative
+basename, so the real mountpoint produces names such as `drive_c on win11`.
+The preferred alias is used when configured; otherwise the hostname is used.
+The original `NAME_OR_ALIAS/SHARE` path is retained as a relative
 symlink, which keeps scripts, terminal navigation, and existing paths working.
 
 Machine and share identifiers cannot contain `/`, `..`, or other traversal
@@ -785,9 +793,9 @@ ts mounts
 
 ```text
 MACHINE       SHARE      REMOTE   LOCAL                                      STATE
-windows-box    drive_c    /C:/     ~/tailscale-fleet/windows-box/drive_c      mounted
-windows-box    drive_d    /D:/     ~/tailscale-fleet/windows-box/drive_d      mounted
-windows-box    drive_f    /F:/     ~/tailscale-fleet/windows-box/drive_f      unmounted
+windows-box    drive_c    /C:/     ~/.local/mnt/windows-box/drive_c      mounted
+windows-box    drive_d    /D:/     ~/.local/mnt/windows-box/drive_d      mounted
+windows-box    drive_f    /F:/     ~/.local/mnt/windows-box/drive_f      unmounted
 ```
 
 Unmounting is likewise single-share or batched and uses `fusermount3` (or the
@@ -932,7 +940,7 @@ There are four portable registries and two host-local direct-transport registrie
 ```text
 rdp.tsv          portable RDP identities and Tailscale endpoints
 ssh-keys.tsv     client login public keys copied to authorized_keys
-fleet.tsv        SSH destinations: target, login user, and OS
+fleet.tsv        preferred names, true hostnames, login users, and OSes
 mounts.tsv       declarative SSHFS shares; local mountpoints are derived
 rdp-direct.tsv   local direct-RDP hypervisor mappings; never shared
 ssh-direct.tsv   local direct-SSH hypervisor mappings; never shared
@@ -1067,6 +1075,18 @@ Those ignored files may still live in the checkout and be consumed by
 `ts config install --from .`; Git simply does not publish them. The tracked
 repository contains the reusable CLI, documentation, and tests.
 
+Every registry starts with a comment header. The complete schemas are:
+
+```text
+rdp.tsv:          # NAME_OR_ALIAS|HOSTNAME|LOCAL_IP|USERNAME|PORT|SERVER_NAME|RDP_ARGS_B64
+ssh-keys.tsv:     # NAME|KEY_TYPE|PUBLIC_KEY|COMMENT_OR_SOURCE|AUTHORIZED_ON
+fleet.tsv:        # NAME_OR_ALIAS|HOSTNAME|SSH_USER|OS
+mounts.tsv:       # NAME_OR_ALIAS|SHARE|REMOTE_PATH|SSH_USER_OVERRIDE
+rdp-direct.tsv:   # NAME_OR_ALIAS|ENDPOINT_PROVIDER|ENDPOINT_VALUE|PORT|LIFECYCLE_PROVIDER|LIFECYCLE_VALUE|OPTIONS_B64
+ssh-direct.tsv:   # NAME_OR_ALIAS|PROVIDER|DOMAIN|HOST_ADDRESS|HOST_PORT|GUEST_PORT|NETDEV|LIBVIRT_URI|START_POLICY|BOOT_TIMEOUT
+credentials.tsv:  # NAME_OR_ALIAS|PASSWORD
+```
+
 Install/merge from Git:
 
 ```bash
@@ -1159,10 +1179,10 @@ ts config host add badasspc \
     --os windows
 ```
 
-If `TARGET` differs from the logical name:
+To give a hostname a preferred controller alias:
 
 ```bash
-ts config host add NAME TARGET \
+ts config host add NAME_OR_ALIAS HOSTNAME \
     --user USER \
     --os linux
 ```
@@ -1182,8 +1202,17 @@ ts config host rm NAME
 `fleet.tsv` stores:
 
 ```text
-NAME|TARGET|SSH_USER|OS
+# NAME_OR_ALIAS|HOSTNAME|SSH_USER|OS
 ```
+
+`NAME_OR_ALIAS` is the controller-facing name. Set it to your preferred alias,
+or make it equal to `HOSTNAME` when no alias is wanted. Commands that use the
+fleet registry accept either value, resolve to the same record, connect to
+`HOSTNAME`, and display `NAME_OR_ALIAS`.
+
+The resolver is also applied to ordinary `ts ssh`, `ts ping`, `ts nc`, and
+`ts file` destination arguments. For example, `ts ssh win11` connects to
+`amauri-i9`, while window titles and mount labels continue to show `win11`.
 
 Despite the `.tsv` suffix, the registry is currently pipe-delimited. Naming things remains one of computer science's least solved problems.
 
@@ -1261,7 +1290,7 @@ ts config key rm machine-name
 `ssh-keys.tsv` stores:
 
 ```text
-NAME|TYPE|PUBLIC_KEY_DATA|COMMENT|TARGETS
+# NAME|KEY_TYPE|PUBLIC_KEY|COMMENT_OR_SOURCE|AUTHORIZED_ON
 ```
 
 Only client login public keys belong here. Private keys and server host keys do not.
@@ -1351,6 +1380,7 @@ existing SSH credential. For temporary passwords, create a gitignored file with
 mode `0600`:
 
 ```text
+# NAME_OR_ALIAS|PASSWORD
 windows-qemu|TEMPORARY_WINDOWS_PASSWORD
 windows-laptop|TEMPORARY_WINDOWS_PASSWORD
 ```
@@ -1763,7 +1793,7 @@ TS_MOUNTS_CONFIG
 
 TS_MOUNT_ROOT
     Deterministic local fleet mount root.
-    Default: ~/tailscale-fleet
+    Default: ~/.local/mnt
 
 TS_FLEET_IDENTITY
     Alternate controller private-key path.
@@ -1834,8 +1864,8 @@ ts acl grant MACHINE PATH_OR_SHARE --system-drive
 ts acl grant MACHINE PATH_OR_SHARE --system-drive --take-ownership
 
 # RDP
-ts rdp add NAME [TARGET] --user USER
-ts rdp add NAME TARGET --server-name CERT_NAME
+ts rdp add NAME_OR_ALIAS [HOSTNAME] --user USER
+ts rdp add NAME_OR_ALIAS HOSTNAME --server-name CERT_NAME
 ts rdp list
 ts rdp credential set NAME
 ts rdp credential set NAME --user USER
@@ -1876,7 +1906,7 @@ ts config path
 ts config show
 
 # Fleet
-ts config host add NAME [TARGET] --user USER --os linux|windows
+ts config host add NAME_OR_ALIAS [HOSTNAME] --user USER --os linux|windows
 ts config host list
 ts config host rm NAME
 

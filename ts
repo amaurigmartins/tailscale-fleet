@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 TS_NAME="ts"
-TS_VERSION="4.5.2"
+TS_VERSION="4.6.0"
 DAEMON_APP="tailscale-user"   # Preserve compatibility with the earlier installer/state.
 
 BASE="${TAILSCALE_USER_HOME:-$HOME/.local/share/$DAEMON_APP}"
@@ -50,6 +50,22 @@ SOCKET=""
 log() { printf '[%s] %s\n' "$TS_NAME" "$*" >&2; }
 die() { log "ERROR: $*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
+
+ensure_registry_header() {
+    local file="$1" header="$2" directory tmp
+    directory="$(dirname "$file")"
+    mkdir -p "$directory"
+    touch "$file"
+    if ! grep -Fqx -- "$header" "$file"; then
+        tmp="$(mktemp "$directory/.registry.XXXXXX")"
+        {
+            printf '%s\n' "$header"
+            cat "$file"
+        } > "$tmp"
+        chmod 600 "$tmp"
+        mv -f -- "$tmp" "$file"
+    fi
+}
 
 systemd_user_available() {
     have systemctl && systemctl --user show-environment >/dev/null 2>&1
@@ -504,7 +520,7 @@ validate_boot_timeout() {
 
 ensure_rdp_config() {
     mkdir -p "$CONFIG_HOME" "$RDP_STATE"
-    touch "$RDP_CONFIG"
+    ensure_registry_header "$RDP_CONFIG" '# NAME_OR_ALIAS|HOSTNAME|LOCAL_IP|USERNAME|PORT|SERVER_NAME|RDP_ARGS_B64'
     chmod 600 "$RDP_CONFIG" 2>/dev/null || true
 }
 
@@ -536,7 +552,16 @@ PY
 rdp_record() {
     local name="$1"
     [[ -f "$RDP_CONFIG" ]] || return 1
-    awk -F '|' -v n="$name" '$1 == n { print; found=1; exit } END { if (!found) exit 1 }' "$RDP_CONFIG"
+    awk -F '|' -v n="$name" \
+        '!/^[[:space:]]*#/ && ($1 == n || $2 == n) { print; found=1; exit } END { if (!found) exit 1 }' \
+        "$RDP_CONFIG"
+}
+
+rdp_canonical_name() {
+    local record
+    record="$(rdp_record "$1" 2>/dev/null || true)"
+    [[ -n "$record" ]] || return 1
+    printf '%s\n' "${record%%|*}"
 }
 
 rdp_auto_ip() {
@@ -566,15 +591,16 @@ rdp_bridge_running() {
 
 rdp_add() {
     ensure_rdp_config
-    [[ $# -ge 1 ]] || die "usage: ts rdp add NAME [TARGET] [--user USER] [--server-name NAME] [--ip 127.x.x.x] [--port PORT] [--rdp-arg ARG ...]"
+    [[ $# -ge 1 ]] || die "usage: ts rdp add NAME_OR_ALIAS [HOSTNAME] [--user USER] [--server-name NAME] [--ip 127.x.x.x] [--port PORT] [--rdp-arg ARG ...]"
 
     local name="$1"; shift
     validate_rdp_name "$name"
 
-    local old="" old_target="" old_ip="" old_user="" old_port="" old_server_name="" old_args_b64=""
+    local old="" old_name="" old_target="" old_ip="" old_user="" old_port="" old_server_name="" old_args_b64=""
     old="$(rdp_record "$name" 2>/dev/null || true)"
     if [[ -n "$old" ]]; then
-        IFS='|' read -r _ old_target old_ip old_user old_port old_server_name old_args_b64 <<<"$old"
+        IFS='|' read -r old_name old_target old_ip old_user old_port old_server_name old_args_b64 <<<"$old"
+        name="$old_name"
     fi
 
     local target="${old_target:-$name}"
@@ -592,6 +618,18 @@ rdp_add() {
         target="$1"
         target_explicit=1
         shift
+    fi
+    if [[ -z "$old" && "$target_explicit" -eq 1 ]]; then
+        old="$(rdp_record "$target" 2>/dev/null || true)"
+        if [[ -n "$old" ]]; then
+            IFS='|' read -r old_name old_target old_ip old_user old_port old_server_name old_args_b64 <<<"$old"
+            target="$old_target"
+            ip="$old_ip"
+            username="$old_user"
+            port="${old_port:-3389}"
+            server_name="$old_server_name"
+            args_b64="$old_args_b64"
+        fi
     fi
 
     while [[ $# -gt 0 ]]; do
@@ -631,13 +669,14 @@ rdp_add() {
     validate_loopback_ip "$ip"
     validate_port "$port"
 
-    if awk -F '|' -v ip="$ip" -v n="$name" '$3 == ip && $1 != n { found=1 } END { exit found ? 0 : 1 }' "$RDP_CONFIG"; then
+    if awk -F '|' -v ip="$ip" -v n="$name" -v old="$old_name" \
+        '$3 == ip && $1 != n && $1 != old { found=1 } END { exit found ? 0 : 1 }' "$RDP_CONFIG"; then
         die "local RDP address $ip is already assigned to another binding"
     fi
 
     local tmp
     tmp="$(mktemp "${TMPDIR:-/tmp}/ts-rdp.XXXXXX")"
-    awk -F '|' -v n="$name" '$1 != n' "$RDP_CONFIG" > "$tmp" || true
+    awk -F '|' -v n="$name" -v t="$target" '$1 != n && $2 != t' "$RDP_CONFIG" > "$tmp" || true
     printf '%s|%s|%s|%s|%s|%s|%s\n' "$name" "$target" "$ip" "$username" "$port" "$server_name" "$args_b64" >> "$tmp"
     sort -t '|' -k1,1 "$tmp" > "$RDP_CONFIG"
     rm -f "$tmp"
@@ -656,8 +695,14 @@ rdp_add() {
 rdp_remove() {
     ensure_rdp_config
     [[ $# -eq 1 ]] || die "usage: ts rdp rm NAME"
-    local name="$1"
-    rdp_record "$name" >/dev/null 2>&1 || die "unknown RDP binding: $name"
+    local requested="$1" name
+    name="$(rdp_canonical_name "$requested" 2>/dev/null || true)"
+    [[ -n "$name" ]] || die "unknown RDP binding: $requested"
+
+    # Direct mappings use the preferred name as their canonical key.
+    if rdp_direct_record "$name" >/dev/null 2>&1; then
+        rdp_direct_remove "$name"
+    fi
 
     local tmp
     tmp="$(mktemp "${TMPDIR:-/tmp}/ts-rdp.XXXXXX")"
@@ -665,12 +710,6 @@ rdp_remove() {
     mv "$tmp" "$RDP_CONFIG"
     chmod 600 "$RDP_CONFIG" 2>/dev/null || true
     log "removed RDP binding: $name"
-
-    # A direct mapping is meaningful only as an alternate transport for an
-    # existing portable RDP binding. Avoid leaving an unusable local record.
-    if rdp_direct_record "$name" >/dev/null 2>&1; then
-        rdp_direct_remove "$name"
-    fi
 
     if rdp_bridge_running; then
         if rdp_has_bindings; then rdp_restart; else rdp_stop; fi
@@ -680,11 +719,11 @@ rdp_remove() {
 rdp_list() {
     ensure_rdp_config
     if ! rdp_has_bindings; then
-        printf 'No RDP bindings. Add one with: ts rdp add NAME [TARGET]\n'
+        printf 'No RDP bindings. Add one with: ts rdp add NAME_OR_ALIAS [HOSTNAME]\n'
         return 0
     fi
 
-    printf '%-18s %-30s %-18s %-22s %-6s %-24s %s\n' NAME TARGET LOCAL USER PORT SERVER_NAME RDP_ARGS
+    printf '%-18s %-30s %-18s %-22s %-6s %-24s %s\n' NAME_OR_ALIAS HOSTNAME LOCAL USER PORT SERVER_NAME RDP_ARGS
     printf '%-18s %-30s %-18s %-22s %-6s %-24s %s\n' '------------------' '------------------------------' '------------------' '----------------------' '------' '------------------------' '----------------'
     local name target ip username port server_name args_b64
     while IFS='|' read -r name target ip username port server_name args_b64; do
@@ -717,7 +756,7 @@ EOF_UNIT
 
 rdp_start() {
     ensure_rdp_config
-    rdp_has_bindings || die "no RDP bindings configured; use 'ts rdp add NAME [TARGET]'"
+    rdp_has_bindings || die "no RDP bindings configured; use 'ts rdp add NAME_OR_ALIAS [HOSTNAME]'"
     have python3 || die "python3 is required for RDP bridging"
     ensure_daemon
     mkdir -p "$RDP_STATE"
@@ -797,11 +836,11 @@ find_freerdp() {
 rdp_args() {
     ensure_rdp_config
     [[ $# -ge 1 ]] || die "usage: ts rdp args NAME [-- ARGS...] | --clear"
-    local name="$1"; shift
+    local requested="$1" name; shift
     local record target ip username port server_name args_b64
-    record="$(rdp_record "$name" 2>/dev/null || true)"
-    [[ -n "$record" ]] || die "unknown RDP binding: $name"
-    IFS='|' read -r _ target ip username port server_name args_b64 <<<"$record"
+    record="$(rdp_record "$requested" 2>/dev/null || true)"
+    [[ -n "$record" ]] || die "unknown RDP binding: $requested"
+    IFS='|' read -r name target ip username port server_name args_b64 <<<"$record"
 
     if [[ $# -eq 0 ]]; then
         format_arg_vector "$args_b64"
@@ -829,7 +868,7 @@ rdp_args() {
 
 ensure_rdp_direct_config() {
     mkdir -p "$CONFIG_HOME" "$(dirname "$RDP_DIRECT_CONFIG")"
-    touch "$RDP_DIRECT_CONFIG"
+    ensure_registry_header "$RDP_DIRECT_CONFIG" '# NAME_OR_ALIAS|ENDPOINT_PROVIDER|ENDPOINT_VALUE|PORT|LIFECYCLE_PROVIDER|LIFECYCLE_VALUE|OPTIONS_B64'
     chmod 600 "$RDP_DIRECT_CONFIG" 2>/dev/null || true
 }
 
@@ -851,18 +890,25 @@ rdp_direct_count() {
 }
 
 rdp_direct_record() {
-    local name="$1"
-    [[ -f "$RDP_DIRECT_CONFIG" ]] || return 1
-    awk -F '|' -v n="$name" '$1 == n { print; found=1; exit } END { if (!found) exit 1 }' "$RDP_DIRECT_CONFIG"
+    local name="$1" record hostname
+    ensure_rdp_direct_config
+    record="$(rdp_record "$name" 2>/dev/null || true)"
+    [[ -n "$record" ]] || return 1
+    IFS='|' read -r name hostname _ <<< "$record"
+    awk -F '|' -v n="$name" -v h="$hostname" \
+        '!/^[[:space:]]*#/ && ($1 == n || $1 == h) { print; found=1; exit } END { if (!found) exit 1 }' \
+        "$RDP_DIRECT_CONFIG"
 }
 
 rdp_direct_write_record() {
     local name="$1" endpoint_provider="$2" endpoint_value="$3" port="$4"
-    local lifecycle_provider="$5" lifecycle_value="$6" options_b64="$7" tmp sorted
+    local lifecycle_provider="$5" lifecycle_value="$6" options_b64="$7" tmp sorted record hostname
     ensure_rdp_direct_config
+    record="$(rdp_record "$name")"
+    IFS='|' read -r name hostname _ <<< "$record"
     tmp="$(mktemp "$(dirname "$RDP_DIRECT_CONFIG")/.rdp-direct.XXXXXX")"
     sorted="$(mktemp "$(dirname "$RDP_DIRECT_CONFIG")/.rdp-direct-sort.XXXXXX")"
-    awk -F '|' -v n="$name" '$1 != n' "$RDP_DIRECT_CONFIG" > "$tmp" || true
+    awk -F '|' -v n="$name" -v h="$hostname" '$1 != n && $1 != h' "$RDP_DIRECT_CONFIG" > "$tmp" || true
     printf '%s|%s|%s|%s|%s|%s|%s\n' \
         "$name" "$endpoint_provider" "$endpoint_value" "$port" \
         "$lifecycle_provider" "$lifecycle_value" "$options_b64" >> "$tmp"
@@ -874,10 +920,11 @@ rdp_direct_write_record() {
 
 rdp_direct_set() {
     [[ $# -ge 1 ]] || die "usage: ts rdp direct set NAME (--libvirt-user-domain DOMAIN | --libvirt-domain DOMAIN | --vmx PATH | --address HOST) [--port PORT]"
-    local name="$1"; shift
+    local requested="$1" name="$1"; shift
     validate_rdp_name "$name"
-    rdp_record "$name" >/dev/null 2>&1 \
-        || die "unknown RDP binding '$name'; add it first with: ts rdp add $name [TARGET]"
+    name="$(rdp_canonical_name "$name" 2>/dev/null || true)"
+    [[ -n "$name" ]] \
+        || die "unknown RDP binding '$requested'; add it first with: ts rdp add $requested [HOSTNAME]"
 
     local old="" old_port="" lifecycle_provider="" lifecycle_value="" old_options=""
     old="$(rdp_direct_record "$name" 2>/dev/null || true)"
@@ -992,6 +1039,8 @@ rdp_direct_set() {
 rdp_direct_lifecycle_set() {
     [[ $# -ge 1 ]] || die "usage: ts rdp direct lifecycle set NAME (--libvirt-domain DOMAIN | --vmx PATH) [--start-policy manual|on-demand]"
     local name="$1"; shift
+    name="$(rdp_canonical_name "$name" 2>/dev/null || true)"
+    [[ -n "$name" ]] || die "unknown RDP binding"
     local record endpoint_provider endpoint_value port options_b64
     record="$(rdp_direct_record "$name" 2>/dev/null || true)"
     [[ -n "$record" ]] || die "no direct RDP mapping for '$name'; configure its endpoint first"
@@ -1042,6 +1091,8 @@ rdp_direct_lifecycle_set() {
 rdp_direct_lifecycle_remove() {
     [[ $# -eq 1 ]] || die "usage: ts rdp direct lifecycle rm NAME"
     local name="$1" record endpoint_provider endpoint_value port provider value options_b64
+    name="$(rdp_canonical_name "$name" 2>/dev/null || true)"
+    [[ -n "$name" ]] || die "unknown RDP binding"
     record="$(rdp_direct_record "$name" 2>/dev/null || true)"
     [[ -n "$record" ]] || die "no direct RDP mapping for '$name'"
     IFS='|' read -r _ endpoint_provider endpoint_value port provider value options_b64 <<<"$record"
@@ -1055,11 +1106,14 @@ rdp_direct_lifecycle_remove() {
 
 rdp_direct_remove() {
     [[ $# -eq 1 ]] || die "usage: ts rdp direct rm NAME"
-    local name="$1" tmp
+    local name="$1" requested="$1" tmp record hostname
+    record="$(rdp_record "$name" 2>/dev/null || true)"
+    [[ -n "$record" ]] || die "unknown RDP binding '$requested'"
+    IFS='|' read -r name hostname _ <<< "$record"
     rdp_direct_record "$name" >/dev/null 2>&1 || die "no direct RDP mapping for '$name'"
     ensure_rdp_direct_config
     tmp="$(mktemp "$(dirname "$RDP_DIRECT_CONFIG")/.rdp-direct.XXXXXX")"
-    awk -F '|' -v n="$name" '$1 != n' "$RDP_DIRECT_CONFIG" > "$tmp" || true
+    awk -F '|' -v n="$name" -v h="$hostname" '$1 != n && $1 != h' "$RDP_DIRECT_CONFIG" > "$tmp" || true
     mv "$tmp" "$RDP_DIRECT_CONFIG"
     chmod 600 "$RDP_DIRECT_CONFIG" 2>/dev/null || true
     log "removed direct RDP mapping: $name"
@@ -1364,6 +1418,8 @@ direct_wait_for_shutdown() {
 rdp_direct_control() {
     [[ $# -eq 2 ]] || die "usage: ts rdp direct start|stop NAME"
     local action="$1" name="$2" record ep ev port provider value options_b64
+    name="$(rdp_canonical_name "$name" 2>/dev/null || true)"
+    [[ -n "$name" ]] || die "unknown RDP binding"
     record="$(rdp_direct_record "$name" 2>/dev/null || true)"
     [[ -n "$record" ]] || die "no direct RDP mapping for '$name'"
     IFS='|' read -r _ ep ev port provider value options_b64 <<<"$record"
@@ -1403,6 +1459,8 @@ rdp_direct_control() {
 rdp_direct_show() {
     [[ $# -eq 1 ]] || die "usage: ts rdp direct show NAME"
     local name="$1" record endpoint_provider endpoint_value port lifecycle_provider lifecycle_value options_b64 state
+    name="$(rdp_canonical_name "$name" 2>/dev/null || true)"
+    [[ -n "$name" ]] || die "unknown RDP binding"
     record="$(rdp_direct_record "$name" 2>/dev/null || true)"
     [[ -n "$record" ]] || die "no direct RDP mapping for '$name'"
     IFS='|' read -r _ endpoint_provider endpoint_value port lifecycle_provider lifecycle_value options_b64 <<<"$record"
@@ -1487,9 +1545,12 @@ rdp_credential_username() {
 }
 
 rdp_credential_lookup() {
-    local name="$1" username="$2" default_username secret
+    local name="$1" username="$2" default_username secret record hostname
     have secret-tool || return 1
-    if secret="$(secret-tool lookup service "$RDP_SECRET_SERVICE" machine "$name" username "$username" 2>/dev/null)" \
+    record="$(rdp_record "$name" 2>/dev/null || true)"
+    [[ -n "$record" ]] || return 1
+    IFS='|' read -r _ hostname _ <<< "$record"
+    if secret="$(secret-tool lookup service "$RDP_SECRET_SERVICE" machine "$hostname" username "$username" 2>/dev/null)" \
         && [[ -n "$secret" ]]; then
         printf '%s' "$secret"
         return
@@ -1497,7 +1558,7 @@ rdp_credential_lookup() {
     # Read the pre-4.4 machine-only entry for the binding's default user.
     default_username="$(rdp_credential_username "$name")"
     [[ "$username" == "$default_username" ]] || return 1
-    secret="$(secret-tool lookup service "$RDP_SECRET_SERVICE" machine "$name" 2>/dev/null)" \
+    secret="$(secret-tool lookup service "$RDP_SECRET_SERVICE" machine "$hostname" 2>/dev/null)" \
         || return 1
     [[ -n "$secret" ]] || return 1
     printf '%s' "$secret"
@@ -1506,7 +1567,9 @@ rdp_credential_lookup() {
 rdp_credential_set() {
     [[ $# -ge 1 ]] || die "usage: ts rdp credential set NAME [--user USER]"
     have secret-tool || die "secret-tool is required (provided by libsecret)"
-    local name="$1" username="" password confirmation; shift
+    local name="$1" username="" password confirmation record hostname; shift
+    name="$(rdp_canonical_name "$name" 2>/dev/null || true)"
+    [[ -n "$name" ]] || die "unknown RDP binding"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --user) [[ $# -ge 2 ]] || die "--user requires a value"; username="$2"; shift 2 ;;
@@ -1514,6 +1577,8 @@ rdp_credential_set() {
         esac
     done
     username="$(rdp_credential_username "$name" "$username")"
+    record="$(rdp_record "$name")"
+    IFS='|' read -r _ hostname _ <<< "$record"
 
     printf 'Windows password for %s (%s): ' "$name" "$username" >&2
     IFS= read -r -s password || die "unable to read password"
@@ -1525,7 +1590,7 @@ rdp_credential_set() {
 
     if printf '%s' "$password" | secret-tool store \
         --label="ts RDP: $name ($username)" \
-        service "$RDP_SECRET_SERVICE" machine "$name" username "$username"; then
+        service "$RDP_SECRET_SERVICE" machine "$hostname" username "$username"; then
         password="" confirmation=""
         log "stored RDP credential for '$name' user '$username' in the desktop keyring"
     else
@@ -1537,6 +1602,8 @@ rdp_credential_set() {
 rdp_credential_status() {
     [[ $# -ge 1 ]] || die "usage: ts rdp credential status NAME [--user USER]"
     local name="$1" username=""; shift
+    name="$(rdp_canonical_name "$name" 2>/dev/null || true)"
+    [[ -n "$name" ]] || die "unknown RDP binding"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --user) [[ $# -ge 2 ]] || die "--user requires a value"; username="$2"; shift 2 ;;
@@ -1555,7 +1622,9 @@ rdp_credential_status() {
 
 rdp_credential_forget() {
     [[ $# -ge 1 ]] || die "usage: ts rdp credential forget NAME [--user USER]"
-    local name="$1" username="" default_username; shift
+    local name="$1" username="" default_username record hostname; shift
+    name="$(rdp_canonical_name "$name" 2>/dev/null || true)"
+    [[ -n "$name" ]] || die "unknown RDP binding"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --user) [[ $# -ge 2 ]] || die "--user requires a value"; username="$2"; shift 2 ;;
@@ -1563,15 +1632,17 @@ rdp_credential_forget() {
         esac
     done
     username="$(rdp_credential_username "$name" "$username")"
+    record="$(rdp_record "$name")"
+    IFS='|' read -r _ hostname _ <<< "$record"
     have secret-tool || die "secret-tool is required (provided by libsecret)"
     default_username="$(rdp_credential_username "$name")"
-    if ! secret-tool clear service "$RDP_SECRET_SERVICE" machine "$name" username "$username" >/dev/null; then
+    if ! secret-tool clear service "$RDP_SECRET_SERVICE" machine "$hostname" username "$username" >/dev/null; then
         if [[ "$username" != "$default_username" ]] \
-            || ! secret-tool clear service "$RDP_SECRET_SERVICE" machine "$name" >/dev/null; then
+            || ! secret-tool clear service "$RDP_SECRET_SERVICE" machine "$hostname" >/dev/null; then
             die "failed to remove RDP credential for '$name' user '$username' from the desktop keyring"
         fi
     elif [[ "$username" == "$default_username" ]]; then
-        secret-tool clear service "$RDP_SECRET_SERVICE" machine "$name" >/dev/null 2>&1 || true
+        secret-tool clear service "$RDP_SECRET_SERVICE" machine "$hostname" >/dev/null 2>&1 || true
     fi
     log "removed RDP credential for '$name' user '$username' from the desktop keyring"
 }
@@ -1609,8 +1680,8 @@ rdp_launch() {
 
     local record target ip username port server_name args_b64
     record="$(rdp_record "$name" 2>/dev/null || true)"
-    [[ -n "$record" ]] || die "unknown RDP binding '$name'; add it with: ts rdp add $name [TARGET]"
-    IFS='|' read -r _ target ip username port server_name args_b64 <<<"$record"
+    [[ -n "$record" ]] || die "unknown RDP binding '$name'; add it with: ts rdp add $name [HOSTNAME]"
+    IFS='|' read -r name target ip username port server_name args_b64 <<<"$record"
     username="${selected_user:-$username}"
     [[ -n "$username" ]] || die "RDP binding '$name' has no username; configure one or pass --user USER"
     server_name="${server_name:-$target}"
@@ -1752,6 +1823,7 @@ rdp_launch() {
 rdp_command() {
     local sub="${1:-list}"
     shift || true
+    ensure_rdp_config
     case "$sub" in
         add) rdp_add "$@" ;;
         rm|remove|del|delete) rdp_remove "$@" ;;
@@ -1770,7 +1842,7 @@ rdp_command() {
 rdp_usage() {
     cat <<'EOF_RDP'
 Usage:
-  ts rdp add NAME [TARGET] [--user USER] [--server-name NAME] [--ip 127.x.x.x] [--port PORT]
+  ts rdp add NAME_OR_ALIAS [HOSTNAME] [--user USER] [--server-name NAME] [--ip 127.x.x.x] [--port PORT]
   ts rdp add NAME ... [--rdp-arg ARG ...] [--clear-rdp-args]
   ts rdp args NAME [-- ARGS...]     Replace persistent per-machine FreeRDP arguments
   ts rdp args NAME --clear         Clear persistent arguments
@@ -1801,10 +1873,10 @@ Independent VM lifecycle:
   ts rdp direct start|stop NAME
 
 Defaults:
-  TARGET       NAME (MagicDNS name is ideal)
+  HOSTNAME     NAME_OR_ALIAS when no separate alias is wanted (MagicDNS name is ideal)
   local IP     first free 127.77.0.x address
   remote port  3389
-  server name  TARGET (override only when the Windows TLS identity differs)
+  server name  HOSTNAME (override only when the Windows TLS identity differs)
   local port   always 3389, on the machine's dedicated loopback address
 
 FreeRDP arguments after MACHINE are relayed verbatim and appended after ts defaults,
@@ -2008,13 +2080,16 @@ PY
 #   NAME TYPE PUBLIC_KEY SOURCE AUTHORIZED_ON
 #
 # fleet.tsv is pipe-delimited:
-#   name | target | ssh_user | os
+#   preferred_name_or_alias | hostname | ssh_user | os
+# The preferred name equals the hostname when no alias is configured.
 # os is linux or windows.
 # -----------------------------------------------------------------------------
 
 ensure_config_registry() {
     mkdir -p "$CONFIG_HOME" "$(dirname "$MOUNTS_CONFIG")"
-    touch "$SSH_KEYS_CONFIG" "$FLEET_CONFIG" "$MOUNTS_CONFIG"
+    ensure_registry_header "$SSH_KEYS_CONFIG" '# NAME|KEY_TYPE|PUBLIC_KEY|COMMENT_OR_SOURCE|AUTHORIZED_ON'
+    ensure_registry_header "$FLEET_CONFIG" '# NAME_OR_ALIAS|HOSTNAME|SSH_USER|OS'
+    ensure_registry_header "$MOUNTS_CONFIG" '# NAME_OR_ALIAS|SHARE|REMOTE_PATH|SSH_USER_OVERRIDE'
     chmod 600 "$SSH_KEYS_CONFIG" "$FLEET_CONFIG" "$MOUNTS_CONFIG" 2>/dev/null || true
 }
 
@@ -2064,6 +2139,7 @@ config_key_add() {
     esac
     [[ "$key_data" =~ ^[A-Za-z0-9+/=]+$ ]] || die "invalid SSH public key payload"
     [[ -n "$targets" ]] || targets="-"
+    targets="$(fleet_canonical_targets "$targets")"
 
     local tmp
     tmp="$(mktemp "${TMPDIR:-/tmp}/ts-keys.XXXXXX")"
@@ -2094,6 +2170,7 @@ config_key_scope() {
     [[ -n "$rec" ]] || die "unknown SSH key: $name"
     IFS=$'|\t' read -r _ key_type key_data comment _ <<< "$rec"
     [[ -n "$targets" ]] || targets="-"
+    targets="$(fleet_canonical_targets "$targets")"
     tmp="$(mktemp "${TMPDIR:-/tmp}/ts-keys.XXXXXX")"
     awk -F '[|\t]' -v n="$name" '$1 != n' "$SSH_KEYS_CONFIG" > "$tmp" || true
     printf '%s|%s|%s|%s|%s\n' "$name" "$key_type" "$key_data" "${comment:-$name}" "$targets" >> "$tmp"
@@ -2117,16 +2194,18 @@ config_key_list() {
 }
 
 config_keys_for_host() {
-    local host="$1"
+    local host="$1" record hostname
     ensure_config_registry
-    awk -F '[|\t]' -v h="$host" '
+    record="$(fleet_record "$host" 2>/dev/null || true)"
+    if [[ -n "$record" ]]; then IFS='|' read -r host hostname _ <<< "$record"; else hostname="$host"; fi
+    awk -F '[|\t]' -v h="$host" -v hn="$hostname" '
         /^[[:space:]]*(#|$)/ {next}
         NF >= 3 {
             targets=$5; if (targets == "") targets="-";
             ok=(targets == "*");
             if (!ok) {
                 n=split(targets,a,",");
-                for (i=1;i<=n;i++) if (a[i] == h) ok=1;
+                for (i=1;i<=n;i++) if (a[i] == h || a[i] == hn) ok=1;
             }
             if (ok) printf "%s %s ts:%s\n", $2, $3, $1;
         }
@@ -2136,16 +2215,70 @@ config_keys_for_host() {
 fleet_record() {
     local name="$1"
     [[ -f "$FLEET_CONFIG" ]] || return 1
-    awk -F '|' -v n="$name" '$1 == n { print; found=1; exit } END { if (!found) exit 1 }' "$FLEET_CONFIG"
+    awk -F '|' -v n="$name" \
+        '!/^[[:space:]]*#/ && ($1 == n || $2 == n) { print; found=1; exit } END { if (!found) exit 1 }' \
+        "$FLEET_CONFIG"
+}
+
+fleet_canonical_name() {
+    local record
+    record="$(fleet_record "$1" 2>/dev/null || true)"
+    [[ -n "$record" ]] || return 1
+    printf '%s\n' "${record%%|*}"
+}
+
+fleet_hostname() {
+    local record name hostname
+    record="$(fleet_record "$1" 2>/dev/null || true)"
+    [[ -n "$record" ]] || return 1
+    IFS='|' read -r name hostname _ <<< "$record"
+    printf '%s\n' "${hostname:-$name}"
+}
+
+fleet_resolve_token() {
+    local token="$1" endpoint="$1" suffix="" user_prefix="" hostname resolved
+    if [[ "$endpoint" == *:* ]]; then
+        suffix=":${endpoint#*:}"
+        endpoint="${endpoint%%:*}"
+    fi
+    if [[ "$endpoint" == *@* ]]; then
+        user_prefix="${endpoint%@*}@"
+        hostname="${endpoint##*@}"
+    else
+        hostname="$endpoint"
+    fi
+    resolved="$(fleet_hostname "$hostname" 2>/dev/null || true)"
+    if [[ -n "$resolved" ]]; then
+        printf '%s%s%s\n' "$user_prefix" "$resolved" "$suffix"
+    else
+        printf '%s\n' "$token"
+    fi
+}
+
+fleet_canonical_targets() {
+    local targets="$1" target result="" canonical
+    local -a items=()
+    [[ "$targets" != '*' && "$targets" != '-' ]] || { printf '%s\n' "$targets"; return; }
+    IFS=',' read -r -a items <<< "$targets"
+    for target in "${items[@]}"; do
+        canonical="$(fleet_canonical_name "$target" 2>/dev/null || printf '%s' "$target")"
+        [[ -z "$result" ]] || result+=,
+        result+="$canonical"
+    done
+    printf '%s\n' "${result:--}"
 }
 
 config_host_add() {
     ensure_config_registry
-    [[ $# -ge 1 ]] || die "usage: ts config host add NAME [TARGET] --user USER --os linux|windows"
+    [[ $# -ge 1 ]] || die "usage: ts config host add NAME_OR_ALIAS [HOSTNAME] --user USER --os linux|windows"
     local name="$1"; shift
     validate_config_name "$name"
-    local target="$name" user="" os=""
-    if [[ $# -gt 0 && "$1" != --* ]]; then target="$1"; shift; fi
+    local target="$name" user="" os="" target_explicit=0 existing=""
+    if [[ $# -gt 0 && "$1" != --* ]]; then target="$1"; target_explicit=1; shift; fi
+    if (( ! target_explicit )); then
+        existing="$(fleet_record "$name" 2>/dev/null || true)"
+        if [[ -n "$existing" ]]; then IFS='|' read -r name target _ _ <<< "$existing"; fi
+    fi
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --user)
@@ -2162,7 +2295,7 @@ config_host_add() {
 
     local tmp
     tmp="$(mktemp "${TMPDIR:-/tmp}/ts-fleet.XXXXXX")"
-    awk -F '|' -v n="$name" '$1 != n' "$FLEET_CONFIG" > "$tmp" || true
+    awk -F '|' -v n="$name" -v t="$target" '$1 != n && $2 != t' "$FLEET_CONFIG" > "$tmp" || true
     printf '%s|%s|%s|%s\n' "$name" "$target" "$user" "$os" >> "$tmp"
     sort -t '|' -k1,1 "$tmp" > "$FLEET_CONFIG"
     rm -f "$tmp"
@@ -2173,8 +2306,9 @@ config_host_add() {
 config_host_remove() {
     ensure_config_registry
     [[ $# -eq 1 ]] || die "usage: ts config host rm NAME"
-    local name="$1" tmp
-    fleet_record "$name" >/dev/null 2>&1 || die "unknown fleet host: $name"
+    local requested="$1" name tmp
+    name="$(fleet_canonical_name "$requested" 2>/dev/null || true)"
+    [[ -n "$name" ]] || die "unknown fleet host: $requested"
     if [[ -f "$MOUNTS_CONFIG" ]] && awk -F '|' -v n="$name" \
         '$1 == n {found=1; exit} END {exit found ? 0 : 1}' "$MOUNTS_CONFIG"; then
         die "fleet host '$name' still has mount definitions; remove them with ts mount rm first"
@@ -2187,7 +2321,7 @@ config_host_remove() {
 
 config_host_list() {
     ensure_config_registry
-    printf '%-20s %-28s %-24s %s\n' NAME TARGET SSH_USER OS
+    printf '%-20s %-28s %-24s %s\n' NAME_OR_ALIAS HOSTNAME SSH_USER OS
     awk -F '|' '/^[[:space:]]*(#|$)/ {next} NF >= 4 {printf "%-20s %-28s %-24s %s\n", $1,$2,$3,$4}' "$FLEET_CONFIG"
 }
 
@@ -2253,6 +2387,7 @@ fleet_ssh_base() {
 validate_fleet_credentials() {
     local path="$1" mode
     [[ -f "$path" && -r "$path" ]] || die "credentials file is not readable: $path"
+    ensure_registry_header "$path" '# NAME_OR_ALIAS|PASSWORD'
     mode="$(stat -c '%a' "$path" 2>/dev/null || true)"
     [[ "$mode" =~ ^[0-7]{3,4}$ ]] || die "unable to inspect credentials file permissions: $path"
     (( (8#$mode & 077) == 0 )) || die "credentials file must not be accessible by group or others: chmod 600 $path"
@@ -2264,11 +2399,13 @@ validate_fleet_credentials() {
 }
 
 fleet_password_for_host() {
-    local path="$1" wanted="$2" name password
+    local path="$1" wanted="$2" name password candidate
     validate_fleet_credentials "$path"
+    wanted="$(fleet_canonical_name "$wanted" 2>/dev/null || printf '%s' "$wanted")"
     while IFS='|' read -r name password; do
         [[ -n "$name" && "$name" != \#* ]] || continue
-        if [[ "$name" == "$wanted" ]]; then
+        candidate="$(fleet_canonical_name "$name" 2>/dev/null || printf '%s' "$name")"
+        if [[ "$candidate" == "$wanted" ]]; then
             printf '%s\n' "$password"
             return 0
         fi
@@ -2420,7 +2557,7 @@ config_push_one() {
     local name="$1" credentials="${2:-}" rec target user os
     rec="$(fleet_record "$name" 2>/dev/null || true)"
     [[ -n "$rec" ]] || die "unknown fleet host '$name'; add it with: ts config host add $name --user USER --os linux|windows"
-    IFS='|' read -r _ target user os <<< "$rec"
+    IFS='|' read -r name target user os <<< "$rec"
     case "$os" in
         linux) config_push_linux "$name" "$target" "$user" "$credentials" ;;
         windows) config_push_windows "$name" "$target" "$user" "$credentials" ;;
@@ -2513,14 +2650,16 @@ EOF_ENROLL_WINDOWS
 }
 
 enroll_targets_without_source() {
-    local source="$1" targets="$2" target result=""
+    local source="$1" targets="$2" target result="" canonical
     local -a target_items=()
     [[ "$targets" != '*' ]] || { printf '*\n'; return; }
+    source="$(fleet_canonical_name "$source" 2>/dev/null || printf '%s' "$source")"
     IFS=',' read -r -a target_items <<< "$targets"
     for target in "${target_items[@]}"; do
-        [[ "$target" != "$source" ]] || continue
+        canonical="$(fleet_canonical_name "$target" 2>/dev/null || printf '%s' "$target")"
+        [[ "$canonical" != "$source" ]] || continue
         if [[ -n "$result" ]]; then result+=","; fi
-        result+="$target"
+        result+="$canonical"
     done
     printf '%s\n' "$result"
 }
@@ -2560,6 +2699,8 @@ config_enroll() {
             fi
         done 3< "$FLEET_CONFIG"
     else
+        selector="$(fleet_canonical_name "$selector" 2>/dev/null || true)"
+        [[ -n "$selector" ]] || die "unknown fleet host"
         scoped_targets="$(enroll_targets_without_source "$selector" "$targets")"
         [[ -n "$scoped_targets" ]] \
             || die "cannot enroll '$selector' only onto itself; choose another --on target"
@@ -2647,6 +2788,7 @@ config_save() {
     local -a portable_names=(rdp.tsv ssh-keys.tsv fleet.tsv mounts.tsv)
     [[ -d "$target_dir" ]] || die "config save target is not a directory: $target_dir"
     target_dir="$(cd "$target_dir" && pwd -P)"
+    ensure_rdp_config
     ensure_config_registry
 
     for source in "${portable_sources[@]}"; do
@@ -2831,24 +2973,40 @@ def normalize_rdp(rec: list[str], origin: str):
 
 
 def merge_rdp(paths: list[Path]):
-    by_name = {}
+    by_hostname = {}
     origins = {}
     for path in paths:
         for lineno, fields in iter_records(path):
             origin = f"{path}:{lineno}"
             rec = normalize_rdp(fields, origin)
-            name = rec[0]
-            if name in by_name and by_name[name] != rec:
-                fail(f"conflicting RDP definition for {name!r}: {origins[name]} vs {origin}")
-            by_name.setdefault(name, rec)
-            origins.setdefault(name, origin)
+            name, hostname = rec[:2]
+            if hostname in by_hostname:
+                existing = by_hostname[hostname]
+                if existing[2:] != rec[2:]:
+                    fail(f"conflicting RDP definition for hostname {hostname!r}: {origins[hostname]} vs {origin}")
+                existing_alias = existing[0] != hostname
+                incoming_alias = name != hostname
+                if existing_alias and incoming_alias and existing[0] != name:
+                    fail(f"conflicting RDP aliases for hostname {hostname!r}: {existing[0]!r} vs {name!r}")
+                if incoming_alias:
+                    by_hostname[hostname] = rec
+                    origins[hostname] = origin
+            else:
+                by_hostname[hostname] = rec
+                origins[hostname] = origin
     by_ip = {}
-    for name, rec in by_name.items():
+    by_identifier = {}
+    for rec in by_hostname.values():
+        name = rec[0]
+        for identifier in rec[:2]:
+            if identifier in by_identifier and by_identifier[identifier] != name:
+                fail(f"RDP name/hostname {identifier!r} is ambiguous between {by_identifier[identifier]!r} and {name!r}")
+            by_identifier[identifier] = name
         ip = rec[2]
         if ip in by_ip and by_ip[ip] != name:
             fail(f"RDP local IP {ip} is assigned to both {by_ip[ip]!r} and {name!r}")
         by_ip[ip] = name
-    return [by_name[k] for k in sorted(by_name)]
+    return sorted(by_hostname.values(), key=lambda rec: rec[0])
 
 
 def normalize_targets(text: str) -> set[str]:
@@ -2929,21 +3087,38 @@ def normalize_fleet(fields: list[str], origin: str):
 
 
 def merge_fleet(paths: list[Path]):
-    by_name = {}
+    by_hostname = {}
     origins = {}
     for path in paths:
         for lineno, fields in iter_records(path):
             origin = f"{path}:{lineno}"
             rec = normalize_fleet(fields, origin)
-            name = rec[0]
-            if name in by_name and by_name[name] != rec:
-                fail(f"conflicting fleet definition for {name!r}: {origins[name]} vs {origin}")
-            by_name.setdefault(name, rec)
-            origins.setdefault(name, origin)
-    return [by_name[k] for k in sorted(by_name)]
+            name, hostname = rec[:2]
+            if hostname in by_hostname:
+                existing = by_hostname[hostname]
+                if existing[2:] != rec[2:]:
+                    fail(f"conflicting fleet definition for hostname {hostname!r}: {origins[hostname]} vs {origin}")
+                existing_alias = existing[0] != hostname
+                incoming_alias = name != hostname
+                if existing_alias and incoming_alias and existing[0] != name:
+                    fail(f"conflicting fleet aliases for hostname {hostname!r}: {existing[0]!r} vs {name!r}")
+                if incoming_alias:
+                    by_hostname[hostname] = rec
+                    origins[hostname] = origin
+            else:
+                by_hostname[hostname] = rec
+                origins[hostname] = origin
+    by_identifier = {}
+    for rec in by_hostname.values():
+        name = rec[0]
+        for identifier in rec[:2]:
+            if identifier in by_identifier and by_identifier[identifier] != name:
+                fail(f"fleet name/hostname {identifier!r} is ambiguous between {by_identifier[identifier]!r} and {name!r}")
+            by_identifier[identifier] = name
+    return sorted(by_hostname.values(), key=lambda rec: rec[0])
 
 
-def normalize_mount(fields: list[str], origin: str, fleet_names: set[str]):
+def normalize_mount(fields: list[str], origin: str, fleet_names: dict[str, str]):
     if len(fields) > 4:
         fail(f"mount definition has more than four fields in {origin}")
     fields = fields + [""] * (4 - len(fields))
@@ -2952,6 +3127,7 @@ def normalize_mount(fields: list[str], origin: str, fleet_names: set[str]):
         fail(f"invalid mount machine {machine!r} in {origin}")
     if machine not in fleet_names:
         fail(f"mount {machine!r}/{share!r} refers to an unknown fleet host in {origin}")
+    machine = fleet_names[machine]
     if not share or not NAME_RE.fullmatch(share) or share in {".", ".."}:
         fail(f"invalid mount share {share!r} in {origin}")
     if not remote:
@@ -2959,7 +3135,7 @@ def normalize_mount(fields: list[str], origin: str, fleet_names: set[str]):
     return (machine, share, remote, user)
 
 
-def merge_mounts(paths: list[Path], fleet_names: set[str]):
+def merge_mounts(paths: list[Path], fleet_names: dict[str, str]):
     by_key = {}
     origins = {}
     for path in paths:
@@ -2985,12 +3161,21 @@ mounts_paths = source_files("mounts.tsv", mounts_target)
 rdp = merge_rdp(rdp_paths)
 keys = merge_keys(key_paths)
 fleet = merge_fleet(fleet_paths)
-mounts = merge_mounts(mounts_paths, {record[0] for record in fleet})
+fleet_names = {identifier: record[0] for record in fleet for identifier in record[:2]}
+mounts = merge_mounts(mounts_paths, fleet_names)
 
-(stage / "rdp.tsv").write_text("".join("|".join(x) + "\n" for x in rdp), encoding="utf-8")
-(stage / "ssh-keys.tsv").write_text("".join("|".join(x) + "\n" for x in keys), encoding="utf-8")
-(stage / "fleet.tsv").write_text("".join("|".join(x) + "\n" for x in fleet), encoding="utf-8")
-(stage / "mounts.tsv").write_text("".join("|".join(x) + "\n" for x in mounts), encoding="utf-8")
+(stage / "rdp.tsv").write_text(
+    "# NAME_OR_ALIAS|HOSTNAME|LOCAL_IP|USERNAME|PORT|SERVER_NAME|RDP_ARGS_B64\n"
+    + "".join("|".join(x) + "\n" for x in rdp), encoding="utf-8")
+(stage / "ssh-keys.tsv").write_text(
+    "# NAME|KEY_TYPE|PUBLIC_KEY|COMMENT_OR_SOURCE|AUTHORIZED_ON\n"
+    + "".join("|".join(x) + "\n" for x in keys), encoding="utf-8")
+(stage / "fleet.tsv").write_text(
+    "# NAME_OR_ALIAS|HOSTNAME|SSH_USER|OS\n"
+    + "".join("|".join(x) + "\n" for x in fleet), encoding="utf-8")
+(stage / "mounts.tsv").write_text(
+    "# NAME_OR_ALIAS|SHARE|REMOTE_PATH|SSH_USER_OVERRIDE\n"
+    + "".join("|".join(x) + "\n" for x in mounts), encoding="utf-8")
 
 print(f"[ts] config source: {source_dir}", file=sys.stderr)
 print(f"[ts] merged RDP bindings: {len(rdp)}", file=sys.stderr)
@@ -3074,7 +3259,7 @@ config_show() {
     printf 'credentials:      %s%s\n' "$FLEET_CREDENTIALS" "$([[ -f "$FLEET_CREDENTIALS" ]] && printf ' (present)' || printf ' (absent)')"
     printf 'fleet-registry:   %s\n' "$FLEET_CONFIG"
     printf 'mount-registry:   %s\n' "$MOUNTS_CONFIG"
-    printf 'mount-root:       %s\n' "${TS_MOUNT_ROOT:-$HOME/tailscale-fleet}"
+    printf 'mount-root:       %s\n' "${TS_MOUNT_ROOT:-$HOME/.local/mnt}"
     printf 'controller-key:   %s%s\n' "$FLEET_IDENTITY" "$([[ -f "$FLEET_IDENTITY" ]] && printf ' (present)' || printf ' (absent)')"
     printf 'backup-retention: %s snapshots\n' "$CONFIG_BACKUP_KEEP"
 }
@@ -3103,7 +3288,7 @@ SSH login public keys (copied to authorized_keys; never server host keys):
   ts config key list
 
 Fleet hosts:
-  ts config host add NAME [TARGET] --user USER --os linux|windows
+  ts config host add NAME_OR_ALIAS [HOSTNAME] --user USER --os linux|windows
   ts config host rm NAME
   ts config host list
 
@@ -3167,13 +3352,12 @@ config_command() {
 # Managed SSHFS fleet mounts
 #
 # mounts.tsv is pipe-delimited portable configuration:
-#   machine | share | remote | ssh_user_override
+#   preferred_name_or_alias | share | remote | ssh_user_override
 # Empty ssh_user_override inherits the login user from fleet.tsv.
 # -----------------------------------------------------------------------------
 
 ensure_mount_config() {
-    mkdir -p "$CONFIG_HOME" "$(dirname "$MOUNTS_CONFIG")"
-    touch "$MOUNTS_CONFIG"
+    ensure_registry_header "$MOUNTS_CONFIG" '# NAME_OR_ALIAS|SHARE|REMOTE_PATH|SSH_USER_OVERRIDE'
     chmod 600 "$MOUNTS_CONFIG" 2>/dev/null || true
 }
 
@@ -3184,10 +3368,13 @@ validate_mount_identifier() {
 }
 
 mount_record() {
-    local machine="$1" share="$2"
+    local machine="$1" share="$2" fleet hostname
     [[ -f "$MOUNTS_CONFIG" ]] || return 1
-    awk -F '|' -v m="$machine" -v s="$share" \
-        '$1 == m && $2 == s { print; found=1; exit } END { if (!found) exit 1 }' \
+    fleet="$(fleet_record "$machine" 2>/dev/null || true)"
+    [[ -n "$fleet" ]] || return 1
+    IFS='|' read -r machine hostname _ <<< "$fleet"
+    awk -F '|' -v m="$machine" -v h="$hostname" -v s="$share" \
+        '!/^[[:space:]]*#/ && ($1 == m || $1 == h) && $2 == s { print; found=1; exit } END { if (!found) exit 1 }' \
         "$MOUNTS_CONFIG"
 }
 
@@ -3201,7 +3388,7 @@ mount_add() (
     local fleet target fleet_user os
     fleet="$(fleet_record "$machine" 2>/dev/null || true)"
     [[ -n "$fleet" ]] || die "unknown fleet host '$machine'; add it with ts config host add first"
-    IFS='|' read -r _ target fleet_user os <<< "$fleet"
+    IFS='|' read -r machine target fleet_user os <<< "$fleet"
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -3242,8 +3429,8 @@ mount_add() (
     tmp="$(mktemp "$mounts_dir/.mounts.tsv.XXXXXX")"
     sorted="$(mktemp "$mounts_dir/.mounts-sorted.tsv.XXXXXX")"
     trap 'rm -f -- "$tmp" "$sorted"' EXIT
-    awk -F '|' -v m="$machine" -v s="$share" \
-        '!($1 == m && $2 == s)' "$MOUNTS_CONFIG" > "$tmp" || true
+    awk -F '|' -v m="$machine" -v h="$target" -v s="$share" \
+        '!((($1 == m) || ($1 == h)) && $2 == s)' "$MOUNTS_CONFIG" > "$tmp" || true
     printf '%s|%s|%s|%s\n' "$machine" "$share" "$remote" "$user" >> "$tmp"
     LC_ALL=C sort -t '|' -k1,1 -k2,2 "$tmp" > "$sorted"
     chmod 600 "$sorted"
@@ -3257,9 +3444,12 @@ mount_add() (
 mount_remove() (
     ensure_mount_config
     [[ $# -eq 2 ]] || die "usage: ts mount rm MACHINE SHARE"
-    local machine="$1" share="$2" tmp mounts_dir
+    local machine="$1" share="$2" tmp mounts_dir fleet hostname
     validate_mount_identifier "mount machine" "$machine"
     validate_mount_identifier "mount share" "$share"
+    fleet="$(fleet_record "$machine" 2>/dev/null || true)"
+    [[ -n "$fleet" ]] || die "unknown fleet host"
+    IFS='|' read -r machine hostname _ <<< "$fleet"
     mount_record "$machine" "$share" >/dev/null 2>&1 \
         || die "unknown mount definition: $machine/$share"
     if mount_state "$machine" "$share" || mount_legacy_state "$machine" "$share"; then
@@ -3268,8 +3458,8 @@ mount_remove() (
     mounts_dir="$(dirname "$MOUNTS_CONFIG")"
     tmp="$(mktemp "$mounts_dir/.mounts.tsv.XXXXXX")"
     trap 'rm -f -- "$tmp"' EXIT
-    awk -F '|' -v m="$machine" -v s="$share" \
-        '!($1 == m && $2 == s)' "$MOUNTS_CONFIG" > "$tmp" || true
+    awk -F '|' -v m="$machine" -v h="$hostname" -v s="$share" \
+        '!((($1 == m) || ($1 == h)) && $2 == s)' "$MOUNTS_CONFIG" > "$tmp" || true
     chmod 600 "$tmp"
     mv -f -- "$tmp" "$MOUNTS_CONFIG"
     trap - EXIT
@@ -3291,7 +3481,7 @@ mount_effective_user() {
 
 mount_list() {
     ensure_mount_config
-    printf '%-20s %-20s %-30s %s\n' MACHINE SHARE REMOTE USER
+    printf '%-20s %-20s %-30s %s\n' NAME_OR_ALIAS SHARE REMOTE USER
     local machine share remote user effective
     while IFS='|' read -r machine share remote user _; do
         [[ -n "$machine" && "$machine" != \#* ]] || continue
@@ -3302,7 +3492,7 @@ mount_list() {
 }
 
 mount_local_path() {
-    local machine="$1" share="$2" root="${TS_MOUNT_ROOT:-$HOME/tailscale-fleet}"
+    local machine="$1" share="$2" root="${TS_MOUNT_ROOT:-$HOME/.local/mnt}"
     validate_mount_identifier "mount machine" "$machine"
     validate_mount_identifier "mount share" "$share"
     [[ "$root" == /* && "$root" != *$'\n'* && "$root" != *$'\r'* ]] \
@@ -3482,7 +3672,7 @@ fleet_mount_one() {
     IFS='|' read -r _ _ remote user <<< "$record"
     fleet="$(fleet_record "$machine" 2>/dev/null || true)"
     if [[ -z "$fleet" ]]; then log "ERROR: unknown fleet host: $machine"; return 1; fi
-    IFS='|' read -r _ target fleet_user os <<< "$fleet"
+    IFS='|' read -r machine target fleet_user os <<< "$fleet"
     user="${user:-$fleet_user}"
     if [[ -z "$user" ]]; then log "ERROR: no SSH user configured for fleet host '$machine'"; return 1; fi
 
@@ -3538,12 +3728,18 @@ fleet_mount_one() {
 }
 
 mount_selected_records() {
-    local machine="${1:-}" share="${2:-}"
+    local machine="${1:-}" share="${2:-}" fleet hostname=""
     ensure_mount_config
+    if [[ -n "$machine" ]]; then
+        fleet="$(fleet_record "$machine" 2>/dev/null || true)"
+        [[ -n "$fleet" ]] || return 1
+        IFS='|' read -r machine hostname _ <<< "$fleet"
+    fi
     if [[ -z "$machine" ]]; then
         awk -F '|' '!/^[[:space:]]*(#|$)/ && NF >= 3 {print}' "$MOUNTS_CONFIG"
     elif [[ -z "$share" ]]; then
-        awk -F '|' -v m="$machine" '!/^[[:space:]]*(#|$)/ && $1 == m && NF >= 3 {print}' "$MOUNTS_CONFIG"
+        awk -F '|' -v m="$machine" -v h="$hostname" \
+            '!/^[[:space:]]*(#|$)/ && ($1 == m || $1 == h) && NF >= 3 {print}' "$MOUNTS_CONFIG"
     else
         mount_record "$machine" "$share"
     fi
@@ -3559,6 +3755,8 @@ mount_runtime() {
     else
         machine="$selector"
         validate_mount_identifier "mount machine" "$machine"
+        machine="$(fleet_canonical_name "$machine" 2>/dev/null || true)"
+        [[ -n "$machine" ]] || die "unknown fleet host '$selector'"
         [[ $# -ge 1 ]] || die "usage: ts mount MACHINE SHARE|--all"
         share="$1"; shift
         if [[ "$share" == --all ]]; then
@@ -3583,6 +3781,8 @@ mount_runtime() {
 
 fleet_unmount_one() {
     local machine="$1" share="$2" canonical_path actual_path unmount_path="" tool
+    machine="$(fleet_canonical_name "$machine" 2>/dev/null || true)"
+    [[ -n "$machine" ]] || { log "ERROR: unknown fleet host"; return 1; }
     canonical_path="$(mount_local_path "$machine" "$share")"
     actual_path="$(mount_actual_path "$machine" "$share")"
     if mount_state "$machine" "$share"; then
@@ -3630,6 +3830,8 @@ unmount_command() {
     else
         machine="$selector"
         validate_mount_identifier "mount machine" "$machine"
+        machine="$(fleet_canonical_name "$machine" 2>/dev/null || true)"
+        [[ -n "$machine" ]] || die "unknown fleet host '$selector'"
         [[ $# -eq 1 ]] || die "usage: ts unmount MACHINE SHARE|--all"
         share="$1"
         if [[ "$share" == --all ]]; then share=""; else validate_mount_identifier "mount share" "$share"; fi
@@ -3651,6 +3853,7 @@ mounts_runtime_list() {
     local machine share remote user local_path state
     while IFS='|' read -r machine share remote user _; do
         [[ -n "$machine" && "$machine" != \#* ]] || continue
+        machine="$(fleet_canonical_name "$machine" 2>/dev/null || printf '%s' "$machine")"
         local_path="$(mount_local_path "$machine" "$share")"
         if mount_state "$machine" "$share"; then state=mounted
         else
@@ -3678,6 +3881,7 @@ mount_active_count() {
     local machine share remote user count=0
     while IFS='|' read -r machine share remote user _; do
         [[ -n "$machine" && "$machine" != \#* ]] || continue
+        machine="$(fleet_canonical_name "$machine" 2>/dev/null || printf '%s' "$machine")"
         if mount_state "$machine" "$share" || mount_legacy_state "$machine" "$share"; then
             count=$((count + 1))
         fi
@@ -3829,7 +4033,7 @@ acl_run() {
     local fleet target user os windows_path script encoded rc alias_record alias_user
     fleet="$(fleet_record "$machine" 2>/dev/null || true)"
     [[ -n "$fleet" ]] || die "unknown fleet host: $machine"
-    IFS='|' read -r _ target user os <<< "$fleet"
+    IFS='|' read -r machine target user os <<< "$fleet"
     [[ "$os" == windows ]] || die "Windows ACL commands require a windows fleet host; '$machine' is '$os'"
     [[ -n "$user" ]] || die "fleet host '$machine' has no SSH user"
     if [[ "$requested" =~ ^[A-Za-z0-9._-]+$ ]]; then
@@ -3903,22 +4107,29 @@ EOF_ACL
 # -----------------------------------------------------------------------------
 
 ensure_ssh_direct_config() {
-    mkdir -p "$CONFIG_HOME"
-    touch "$SSH_DIRECT_CONFIG"
+    ensure_registry_header "$SSH_DIRECT_CONFIG" '# NAME_OR_ALIAS|PROVIDER|DOMAIN|HOST_ADDRESS|HOST_PORT|GUEST_PORT|NETDEV|LIBVIRT_URI|START_POLICY|BOOT_TIMEOUT'
     chmod 600 "$SSH_DIRECT_CONFIG" 2>/dev/null || true
 }
 
 ssh_direct_record() {
-    local name="$1"
-    [[ -f "$SSH_DIRECT_CONFIG" ]] || return 1
-    awk -F '|' -v n="$name" '$1 == n {print; found=1; exit} END {if (!found) exit 1}' "$SSH_DIRECT_CONFIG"
+    local name="$1" fleet hostname
+    ensure_ssh_direct_config
+    fleet="$(fleet_record "$name" 2>/dev/null || true)"
+    [[ -n "$fleet" ]] || return 1
+    IFS='|' read -r name hostname _ <<< "$fleet"
+    awk -F '|' -v n="$name" -v h="$hostname" \
+        '!/^[[:space:]]*#/ && ($1 == n || $1 == h) {print; found=1; exit} END {if (!found) exit 1}' \
+        "$SSH_DIRECT_CONFIG"
 }
 
 ssh_direct_set() {
     [[ $# -ge 1 ]] || die "usage: ts ssh direct set NAME --libvirt-user-domain DOMAIN [OPTIONS]"
-    local name="$1" domain="" uri="" host="127.0.0.1" host_port="10022"
+    local name="$1" domain="" uri="" host="127.0.0.1" host_port="10022" fleet hostname
     local guest_port="22" netdev="hostnet0" policy="on-demand" timeout="180" tmp sorted; shift
     validate_config_name "$name"
+    fleet="$(fleet_record "$name" 2>/dev/null || true)"
+    [[ -n "$fleet" ]] || die "unknown fleet host"
+    IFS='|' read -r name hostname _ <<< "$fleet"
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --libvirt-user-domain) [[ $# -ge 2 ]] || die "$1 requires a value"; domain="$2"; shift 2 ;;
@@ -3944,7 +4155,7 @@ ssh_direct_set() {
     ensure_ssh_direct_config
     tmp="$(mktemp "$CONFIG_HOME/.ssh-direct.XXXXXX")"
     sorted="$(mktemp "$CONFIG_HOME/.ssh-direct-sort.XXXXXX")"
-    awk -F '|' -v n="$name" '$1 != n' "$SSH_DIRECT_CONFIG" > "$tmp" || true
+    awk -F '|' -v n="$name" -v h="$hostname" '$1 != n && $1 != h' "$SSH_DIRECT_CONFIG" > "$tmp" || true
     printf '%s|libvirt-user|%s|%s|%s|%s|%s|%s|%s|%s\n' \
         "$name" "$domain" "$host" "$host_port" "$guest_port" "$netdev" "$uri" "$policy" "$timeout" >> "$tmp"
     sort -t '|' -k1,1 "$tmp" > "$sorted"
@@ -3956,11 +4167,14 @@ ssh_direct_set() {
 
 ssh_direct_remove() {
     [[ $# -eq 1 ]] || die "usage: ts ssh direct rm NAME"
-    local name="$1" tmp
+    local name="$1" tmp fleet hostname
+    fleet="$(fleet_record "$name" 2>/dev/null || true)"
+    [[ -n "$fleet" ]] || die "unknown fleet host"
+    IFS='|' read -r name hostname _ <<< "$fleet"
     ssh_direct_record "$name" >/dev/null 2>&1 || die "no direct SSH mapping for '$name'"
     ensure_ssh_direct_config
     tmp="$(mktemp "$CONFIG_HOME/.ssh-direct.XXXXXX")"
-    awk -F '|' -v n="$name" '$1 != n' "$SSH_DIRECT_CONFIG" > "$tmp" || true
+    awk -F '|' -v n="$name" -v h="$hostname" '$1 != n && $1 != h' "$SSH_DIRECT_CONFIG" > "$tmp" || true
     mv "$tmp" "$SSH_DIRECT_CONFIG"
     chmod 600 "$SSH_DIRECT_CONFIG" 2>/dev/null || true
     log "removed direct SSH mapping: $name"
@@ -3980,6 +4194,8 @@ ssh_direct_list() {
 ssh_direct_show() {
     [[ $# -eq 1 ]] || die "usage: ts ssh direct show NAME"
     local record name="$1" provider domain host host_port guest_port netdev uri policy timeout state
+    name="$(fleet_canonical_name "$name" 2>/dev/null || true)"
+    [[ -n "$name" ]] || die "unknown fleet host"
     record="$(ssh_direct_record "$name" 2>/dev/null || true)"
     [[ -n "$record" ]] || die "no direct SSH mapping for '$name'"
     IFS='|' read -r _ provider domain host host_port guest_port netdev uri policy timeout <<< "$record"
@@ -4015,6 +4231,8 @@ ssh_direct_launch() {
     [[ $# -ge 1 ]] || die "usage: ts ssh --direct NAME [SSH_OPTIONS] [-- REMOTE_COMMAND...]"
     local name="$1" record provider domain host host_port guest_port netdev uri policy timeout
     local fleet target user os saw_separator=0; shift
+    name="$(fleet_canonical_name "$name" 2>/dev/null || true)"
+    [[ -n "$name" ]] || die "unknown fleet host"
     local -a ssh_options=() remote_command=()
     while [[ $# -gt 0 ]]; do
         if (( saw_separator )); then remote_command+=("$1"); else
@@ -4028,7 +4246,7 @@ ssh_direct_launch() {
     [[ "$provider" == libvirt-user ]] || die "unsupported direct SSH provider: $provider"
     fleet="$(fleet_record "$name" 2>/dev/null || true)"
     [[ -n "$fleet" ]] || die "unknown fleet host '$name'"
-    IFS='|' read -r _ target user os <<< "$fleet"
+    IFS='|' read -r name target user os <<< "$fleet"
     direct_lifecycle_prepare libvirt "$domain" "$uri" "$policy"
     direct_prepare_libvirt_user "$domain" "$uri" "$host" "$host_port" "$guest_port" "$netdev"
     ssh_direct_wait_ready "$host" "$host_port" "$timeout"
@@ -4049,9 +4267,20 @@ ts_ssh() {
         return
     fi
     ensure_daemon
-    local proxy_cmd
+    local proxy_cmd arg saw_separator=0
+    local -a resolved_args=()
+    for arg in "$@"; do
+        if (( saw_separator )); then
+            resolved_args+=("$arg")
+        elif [[ "$arg" == -- ]]; then
+            saw_separator=1
+            resolved_args+=("$arg")
+        else
+            resolved_args+=("$(fleet_resolve_token "$arg")")
+        fi
+    done
     printf -v proxy_cmd '%q --socket=%q nc %%h %%p' "$TAILSCALE" "$SOCKET"
-    exec ssh -o "ProxyCommand=$proxy_cmd" "$@"
+    exec ssh -o "ProxyCommand=$proxy_cmd" "${resolved_args[@]}"
 }
 
 ssh_usage() {
@@ -4220,7 +4449,7 @@ Core:
   ts doctor                 Check local dependencies/runtime
 
 RDP:
-  ts rdp add NAME [TARGET] [--user USER] [--server-name NAME] [--ip 127.x.x.x] [--port PORT]
+  ts rdp add NAME_OR_ALIAS [HOSTNAME] [--user USER] [--server-name NAME] [--ip 127.x.x.x] [--port PORT]
   ts rdp rm NAME
   ts rdp list
   ts rdp start|stop|restart|status
@@ -4241,7 +4470,7 @@ RDP:
 Fleet configuration:
   ts config controller init [NAME]
   ts config key add NAME PUBLIC_KEY [--on HOST[,HOST...]]
-  ts config host add NAME [TARGET] --user USER --os linux|windows
+  ts config host add NAME_OR_ALIAS [HOSTNAME] --user USER --os linux|windows
   ts config push HOST|--all
   ts config bootstrap HOST|--all --credentials FILE
   ts config enroll HOST|--all --on HOST[,HOST...]|*
@@ -4290,7 +4519,7 @@ Environment:
   TS_FLEET_CREDENTIALS       bootstrap password file (default: ~/.config/ts/credentials.tsv)
   TS_FLEET_CONFIG            alternate fleet host registry path
   TS_MOUNTS_CONFIG           alternate portable mount registry path
-  TS_MOUNT_ROOT              fleet mount root (default: ~/tailscale-fleet)
+  TS_MOUNT_ROOT              fleet mount root (default: ~/.local/mnt)
   TS_FLEET_IDENTITY          controller private key (default: ~/.ssh/ts-fleet-ed25519)
   TS_CONFIG_BACKUP_KEEP      retained config-install snapshots (default: 5)
 EOF_USAGE
@@ -4366,6 +4595,20 @@ main() {
             ;;
         rdp)
             rdp_command "$@"
+            ;;
+        ping|nc)
+            if [[ $# -ge 1 ]]; then
+                local resolved_host
+                resolved_host="$(fleet_hostname "$1" 2>/dev/null || printf '%s' "$1")"
+                set -- "$resolved_host" "${@:2}"
+            fi
+            ts_cli "$cmd" "$@"
+            ;;
+        file)
+            local arg
+            local -a resolved_file_args=()
+            for arg in "$@"; do resolved_file_args+=("$(fleet_resolve_token "$arg")"); done
+            ts_cli file "${resolved_file_args[@]}"
             ;;
         uninstall)
             uninstall_program
