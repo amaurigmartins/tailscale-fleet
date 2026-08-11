@@ -2,7 +2,7 @@
 
 Toolkit for turning a pile of Linux machines, Windows boxes, VMware guests, remote workstations, QEMU self-inflicted suffering, and corporate-managed nonsense into one private Tailscale realm without needing root on the client machine.
 
-Current `ts` version: **4.5.0**
+Current `ts` version: **4.5.2**
 
 The executable is simply:
 
@@ -39,7 +39,8 @@ Rocky / rootless Linux
         +---- Tailscale Serve :22 <--------------- fleet return SSH
         |
         +---- SSHFS/FUSE ------------------------> fleet host SFTP
-        |       +-- ~/tailscale-fleet/MACHINE/SHARE
+        |       +-- ~/tailscale-fleet/MACHINE/SHARE on MACHINE
+        |       +-- stable SHARE symlink -> SHARE on MACHINE
         |       +-- ProxyCommand: ts nc HOST 22
         |
         +---- Windows ACL control ---------------> PowerShell / icacls
@@ -348,9 +349,17 @@ ts rdp hostname-vmware
 ```text
 +clipboard
 /dynamic-resolution
+/title:FreeRDP: tailscale-fleet MACHINE
 ```
 
 Yes, **clipboard redirection is enabled by default**. This project refuses to accept a world where a VM/remote-desktop stack cannot reliably move text from Ctrl+C to Ctrl+V across two computers. We put humans on the fucking Moon.
+
+The window title uses the configured `ts` machine name rather than the bridge
+or direct endpoint IP. Override it for one launch with, for example:
+
+```bash
+ts rdp badasspc -- '/title:Custom RDP session'
+```
 
 ## Passwordless RDP with the desktop keyring
 
@@ -638,17 +647,24 @@ ROOTLESS CONTROLLER
 
 ~/tailscale-fleet/
 ├── windows-box/
-│   ├── drive_c/
-│   ├── drive_d/
-│   └── drive_f/
+│   ├── drive_c -> drive_c on windows-box/
+│   ├── drive_c on windows-box/        # FUSE mount shown by Files
+│   ├── drive_d -> drive_d on windows-box/
+│   ├── drive_d on windows-box/
+│   ├── drive_f -> drive_f on windows-box/
+│   └── drive_f on windows-box/
 ├── windows-vm/
-│   ├── drive_c/
-│   └── drive_d/
+│   ├── drive_c -> drive_c on windows-vm/
+│   ├── drive_c on windows-vm/
+│   ├── drive_d -> drive_d on windows-vm/
+│   └── drive_d on windows-vm/
 └── linux-machine/
-    ├── home/
-    └── data/
+    ├── home -> home on linux-machine/
+    ├── home on linux-machine/
+    ├── data -> data on linux-machine/
+    └── data on linux-machine/
 
-drive_c
+drive_c on windows-box
     |
     +-- SSHFS/FUSE
           |
@@ -685,11 +701,17 @@ linux-box|data|/srv/data|
 
 An empty `USER` inherits the SSH login user from `fleet.tsv`. A mount machine
 must already exist there because its target, user, and OS metadata are part of
-the transport. The local path is derived rather than stored:
+the transport. Both local paths are derived rather than stored:
 
 ```text
-${TS_MOUNT_ROOT:-$HOME/tailscale-fleet}/MACHINE/SHARE
+stable path:      ${TS_MOUNT_ROOT:-$HOME/tailscale-fleet}/MACHINE/SHARE
+FUSE mountpoint:  ${TS_MOUNT_ROOT:-$HOME/tailscale-fleet}/MACHINE/SHARE on MACHINE
 ```
+
+GNOME Files derives a local FUSE mount's sidebar name from the mountpoint
+basename, so the real mountpoint produces names such as `drive_c on
+windows-box`. The original `MACHINE/SHARE` path is retained as a relative
+symlink, which keeps scripts, terminal navigation, and existing paths working.
 
 Machine and share identifiers cannot contain `/`, `..`, or other traversal
 syntax. `TS_MOUNT_ROOT` must be absolute.
@@ -751,8 +773,9 @@ ts mount windows-box drive_d -- -o cache=yes
 
 Repeated mounting is idempotent. `ts` checks the actual mount table and the
 fleet `fsname`; it does not mistake an existing empty directory for a live
-filesystem. If some unrelated filesystem occupies the deterministic path, it
-refuses to stack another mount there.
+filesystem. If some unrelated filesystem occupies either derived path, it
+refuses to stack another mount there. It also refuses to replace or mount over
+local data when creating the compatibility symlink.
 
 Runtime inspection combines configuration with real OS mount state:
 
@@ -780,6 +803,19 @@ An already-unmounted share is a success. Mountpoint directories may remain;
 `ts` never recursively deletes arbitrary content under the mount root. Batch
 operations attempt every independent record, report individual failures, and
 return failure if any item failed.
+
+Mounts created by version 4.5.0 at the old `MACHINE/SHARE` mountpoint remain
+fully manageable and appear in `ts mounts` as `mounted-legacy-label`. To adopt
+the descriptive Files name without interrupting an active filesystem, explicitly
+unmount and mount it once:
+
+```bash
+ts unmount windows-box drive_c
+ts mount windows-box drive_c
+```
+
+The empty old mountpoint is then replaced with the compatibility symlink. No
+mounted filesystem is changed automatically during upgrade or config install.
 
 SSHFS, a compatible FUSE unmount command, and accessible `/dev/fuse` are needed
 only for mounting. Their absence does not affect SSH, RDP, ACL inspection, or

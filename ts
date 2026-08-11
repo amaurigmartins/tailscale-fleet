@@ -7,7 +7,7 @@ set -Eeuo pipefail
 umask 077
 
 TS_NAME="ts"
-TS_VERSION="4.5.0"
+TS_VERSION="4.5.2"
 DAEMON_APP="tailscale-user"   # Preserve compatibility with the earlier installer/state.
 
 BASE="${TAILSCALE_USER_HOME:-$HOME/.local/share/$DAEMON_APP}"
@@ -1657,7 +1657,8 @@ rdp_launch() {
     # The TCP connection may terminate at a loopback bridge/direct endpoint,
     # but TLS/NLA must validate the actual Windows host. User arguments are
     # examined first and then appended last, so they can override our defaults.
-    local help_text has_server_override=0 has_cert_policy=0 has_auth_override=0 arg
+    local help_text has_server_override=0 has_cert_policy=0 has_auth_override=0
+    local has_title_override=0 arg
     help_text="$("$freerdp" /help 2>&1 || true)"
     for arg in "${user_args[@]}"; do
         case "$arg" in
@@ -1669,7 +1670,18 @@ rdp_launch() {
         case "${arg,,}" in
             /u:*|/username:*|/p:*|/password:*|/from-stdin*|/pth:*|/pass-the-hash:*) has_auth_override=1 ;;
         esac
+        case "${arg,,}" in
+            /t:*|/title:*) has_title_override=1 ;;
+        esac
     done
+
+    if (( ! has_title_override )); then
+        if grep -q '/title:' <<<"$help_text"; then
+            args+=("/title:FreeRDP: tailscale-fleet $name")
+        elif grep -q '/t:' <<<"$help_text"; then
+            args+=("/t:FreeRDP: tailscale-fleet $name")
+        fi
+    fi
 
     if (( ! has_server_override )); then
         if grep -q '/server-name:' <<<"$help_text"; then
@@ -3250,7 +3262,7 @@ mount_remove() (
     validate_mount_identifier "mount share" "$share"
     mount_record "$machine" "$share" >/dev/null 2>&1 \
         || die "unknown mount definition: $machine/$share"
-    if mount_state "$machine" "$share"; then
+    if mount_state "$machine" "$share" || mount_legacy_state "$machine" "$share"; then
         die "mount '$machine/$share' is active; unmount it before removing the definition"
     fi
     mounts_dir="$(dirname "$MOUNTS_CONFIG")"
@@ -3300,6 +3312,28 @@ mount_local_path() {
         printf '/%s/%s\n' "$machine" "$share"
     else
         printf '%s/%s/%s\n' "$root" "$machine" "$share"
+    fi
+}
+
+mount_display_name() {
+    local machine="$1" share="$2"
+    validate_mount_identifier "mount machine" "$machine"
+    validate_mount_identifier "mount share" "$share"
+    printf '%s on %s\n' "$share" "$machine"
+}
+
+# GNOME Files derives a local FUSE mount's visible name from the mountpoint
+# basename. Mount at the descriptive path while keeping mount_local_path as a
+# stable compatibility symlink for scripts and existing navigation.
+mount_actual_path() {
+    local machine="$1" share="$2" canonical parent
+    canonical="$(mount_local_path "$machine" "$share")"
+    parent="${canonical%/*}"
+    [[ -n "$parent" ]] || parent=/
+    if [[ "$parent" == / ]]; then
+        printf '/%s\n' "$(mount_display_name "$machine" "$share")"
+    else
+        printf '%s/%s\n' "$parent" "$(mount_display_name "$machine" "$share")"
     fi
 }
 
@@ -3355,10 +3389,9 @@ mount_state_info() {
 }
 
 # Return 0 for this fleet SSHFS mount, 1 for unmounted, and 2 when another
-# filesystem occupies the deterministic mountpoint.
-mount_state() {
-    local machine="$1" share="$2" path info fstype source expected
-    path="$(mount_local_path "$machine" "$share")"
+# filesystem occupies the given mountpoint.
+mount_state_at_path() {
+    local path="$1" machine="$2" share="$3" info fstype source expected
     expected="$(mount_fsname "$machine" "$share")"
     if ! info="$(mount_state_info "$path")"; then return 1; fi
     IFS='|' read -r fstype source <<< "$info"
@@ -3366,6 +3399,57 @@ mount_state() {
         return 0
     fi
     return 2
+}
+
+mount_state() {
+    mount_state_at_path "$(mount_actual_path "$1" "$2")" "$1" "$2"
+}
+
+# Version 4.5.0 mounted directly at MACHINE/SHARE. Recognize that layout so an
+# upgrade never strands or silently remounts a live filesystem.
+mount_legacy_state() {
+    mount_state_at_path "$(mount_local_path "$1" "$2")" "$1" "$2"
+}
+
+mount_prepare_compatibility_path() {
+    local machine="$1" share="$2" actual_is_mounted="${3:-0}"
+    local canonical actual parent expected_target resolved
+    canonical="$(mount_local_path "$machine" "$share")"
+    actual="$(mount_actual_path "$machine" "$share")"
+    parent="${canonical%/*}"
+    [[ -n "$parent" ]] || parent=/
+    mkdir -p -- "$parent"
+
+    if [[ ! -e "$actual" ]]; then mkdir -p -- "$actual"; fi
+    if [[ ! -d "$actual" || -L "$actual" ]]; then
+        log "ERROR: Files-facing mountpoint is not a normal directory: $actual"
+        return 1
+    fi
+    if (( ! actual_is_mounted )) && find "$actual" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null | grep -q .; then
+        log "ERROR: refusing to hide local data in Files-facing mountpoint: $actual"
+        return 1
+    fi
+
+    if [[ -L "$canonical" ]]; then
+        resolved="$(readlink -f -- "$canonical" 2>/dev/null || true)"
+        expected_target="$(readlink -f -- "$actual" 2>/dev/null || printf '%s' "$actual")"
+        if [[ "$resolved" != "$expected_target" ]]; then
+            log "ERROR: compatibility path points somewhere unexpected: $canonical"
+            return 1
+        fi
+        return 0
+    fi
+    if [[ -e "$canonical" ]]; then
+        if [[ ! -d "$canonical" ]]; then
+            log "ERROR: compatibility path is not a directory: $canonical"
+            return 1
+        fi
+        if ! rmdir -- "$canonical" 2>/dev/null; then
+            log "ERROR: compatibility path contains local data; refusing to replace it: $canonical"
+            return 1
+        fi
+    fi
+    ln -s -- "$(basename "$actual")" "$canonical"
 }
 
 mount_unmount_tool() {
@@ -3392,7 +3476,7 @@ mount_proxy_cmd() {
 
 fleet_mount_one() {
     local machine="$1" share="$2"; shift 2
-    local record fleet target fleet_user os remote user local_path fsname proxy_cmd
+    local record fleet target fleet_user os remote user canonical_path actual_path fsname proxy_cmd
     record="$(mount_record "$machine" "$share" 2>/dev/null || true)"
     if [[ -z "$record" ]]; then log "ERROR: unknown mount definition: $machine/$share"; return 1; fi
     IFS='|' read -r _ _ remote user <<< "$record"
@@ -3402,25 +3486,37 @@ fleet_mount_one() {
     user="${user:-$fleet_user}"
     if [[ -z "$user" ]]; then log "ERROR: no SSH user configured for fleet host '$machine'"; return 1; fi
 
-    local_path="$(mount_local_path "$machine" "$share")"
+    canonical_path="$(mount_local_path "$machine" "$share")"
+    actual_path="$(mount_actual_path "$machine" "$share")"
     fsname="$(mount_fsname "$machine" "$share")"
     if mount_state "$machine" "$share"; then
-        log "mount already active: $machine/$share -> $(mount_display_path "$local_path")"
+        mount_prepare_compatibility_path "$machine" "$share" 1 || return 1
+        log "mount already active: $(mount_display_name "$machine" "$share") -> $(mount_display_path "$canonical_path")"
         return 0
     else
         local state_rc=$?
         if (( state_rc == 2 )); then
-            log "ERROR: mountpoint is occupied by an incompatible filesystem: $local_path"
+            log "ERROR: mountpoint is occupied by an incompatible filesystem: $actual_path"
             return 1
         fi
     fi
 
-    mkdir -p -- "$local_path"
-    [[ -d "$local_path" && ! -L "$local_path" ]] \
-        || { log "ERROR: mountpoint is not a normal directory: $local_path"; return 1; }
+    if mount_legacy_state "$machine" "$share"; then
+        log "mount already active with legacy Files label '$share': $canonical_path"
+        log "unmount and mount '$machine/$share' again to display '$(mount_display_name "$machine" "$share")'"
+        return 0
+    else
+        local legacy_state_rc=$?
+        if (( legacy_state_rc == 2 )); then
+            log "ERROR: compatibility path is occupied by an incompatible filesystem: $canonical_path"
+            return 1
+        fi
+    fi
+
+    mount_prepare_compatibility_path "$machine" "$share" 0 || return 1
     proxy_cmd="$(mount_proxy_cmd)"
     local -a command=(
-        sshfs "$user@$target:$remote" "$local_path"
+        sshfs "$user@$target:$remote" "$actual_path"
         -o "ProxyCommand=$proxy_cmd"
         -o reconnect
         -o ServerAliveInterval=15
@@ -3430,9 +3526,9 @@ fleet_mount_one() {
     )
     [[ -f "$FLEET_IDENTITY" ]] && command+=(-o "IdentityFile=$FLEET_IDENTITY")
     command+=("$@")
-    log "mounting $machine/$share -> $(mount_display_path "$local_path")"
+    log "mounting $(mount_display_name "$machine" "$share") -> $(mount_display_path "$actual_path")"
     if "${command[@]}"; then
-        log "mounted $machine/$share"
+        log "mounted $machine/$share; stable path: $(mount_display_path "$canonical_path")"
         return 0
     else
         local rc=$?
@@ -3486,25 +3582,35 @@ mount_runtime() {
 }
 
 fleet_unmount_one() {
-    local machine="$1" share="$2" local_path tool
-    local_path="$(mount_local_path "$machine" "$share")"
+    local machine="$1" share="$2" canonical_path actual_path unmount_path="" tool
+    canonical_path="$(mount_local_path "$machine" "$share")"
+    actual_path="$(mount_actual_path "$machine" "$share")"
     if mount_state "$machine" "$share"; then
-        :
+        unmount_path="$actual_path"
     else
         local state_rc=$?
-        if (( state_rc == 1 )); then
+        if (( state_rc == 2 )); then
+            log "ERROR: refusing to unmount incompatible filesystem at $actual_path"
+            return 1
+        fi
+        if mount_legacy_state "$machine" "$share"; then
+            unmount_path="$canonical_path"
+        else
+            local legacy_state_rc=$?
+            if (( legacy_state_rc == 2 )); then
+                log "ERROR: refusing to unmount incompatible filesystem at $canonical_path"
+                return 1
+            fi
             log "mount already inactive: $machine/$share"
             return 0
         fi
-        log "ERROR: refusing to unmount incompatible filesystem at $local_path"
-        return 1
     fi
     tool="$(mount_unmount_tool 2>/dev/null || true)"
     [[ -n "$tool" ]] || { log "ERROR: fusermount3 or compatible fusermount is required"; return 1; }
-    log "unmounting $machine/$share"
-    if "$tool" -u -- "$local_path"; then
-        if mount_state "$machine" "$share"; then
-            log "ERROR: filesystem still mounted at $local_path"
+    log "unmounting $(mount_display_name "$machine" "$share")"
+    if "$tool" -u -- "$unmount_path"; then
+        if mount_state_info "$unmount_path" >/dev/null 2>&1; then
+            log "ERROR: filesystem still mounted at $unmount_path"
             return 1
         fi
         log "unmounted $machine/$share"
@@ -3548,7 +3654,14 @@ mounts_runtime_list() {
         local_path="$(mount_local_path "$machine" "$share")"
         if mount_state "$machine" "$share"; then state=mounted
         else
-            case $? in 1) state=unmounted ;; *) state=occupied ;; esac
+            local actual_state_rc=$?
+            if (( actual_state_rc == 2 )); then
+                state=occupied
+            elif mount_legacy_state "$machine" "$share"; then
+                state=mounted-legacy-label
+            else
+                case $? in 1) state=unmounted ;; *) state=occupied ;; esac
+            fi
         fi
         printf '%-20s %-20s %-24s %-48s %s\n' \
             "$machine" "$share" "$remote" "$(mount_display_path "$local_path")" "$state"
@@ -3565,7 +3678,9 @@ mount_active_count() {
     local machine share remote user count=0
     while IFS='|' read -r machine share remote user _; do
         [[ -n "$machine" && "$machine" != \#* ]] || continue
-        if mount_state "$machine" "$share"; then count=$((count + 1)); fi
+        if mount_state "$machine" "$share" || mount_legacy_state "$machine" "$share"; then
+            count=$((count + 1))
+        fi
     done < "$MOUNTS_CONFIG"
     printf '%s\n' "$count"
 }

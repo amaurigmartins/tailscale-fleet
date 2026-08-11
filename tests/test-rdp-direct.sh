@@ -59,8 +59,14 @@ run_launch() {
 run_launch windows --direct -- /f
 assert_contains "$MOCK_FREERDP_LOG" '/v:127.0.0.1:13389'
 assert_contains "$MOCK_FREERDP_LOG" '/server-name:windows-cert'
+assert_contains "$MOCK_FREERDP_LOG" '/title:FreeRDP: tailscale-fleet windows'
 assert_contains "$MOCK_FREERDP_LOG" '/f'
-pass 'static direct endpoint launches FreeRDP'
+run_launch windows --direct -- '/title:Custom RDP session'
+assert_contains "$MOCK_FREERDP_LOG" '/title:Custom RDP session'
+if grep -Fqx -- '/title:FreeRDP: tailscale-fleet windows' "$MOCK_FREERDP_LOG"; then
+    fail 'explicit FreeRDP title did not replace the default title'
+fi
+pass 'static direct endpoint launches FreeRDP with an overridable machine title'
 
 printf 'alice-password\nalice-password\n' | "$TS" rdp credential set windows >/dev/null
 printf 'bob-password\nbob-password\n' | "$TS" rdp credential set windows --user Bob >/dev/null

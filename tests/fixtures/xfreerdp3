@@ -2,7 +2,7 @@
 set -eu
 
 if [[ "${1:-}" == /help ]]; then
-    printf '%s\n' '/server-name:hostname' '/cert:tofu' '/from-stdin[:force]'
+    printf '%s\n' '/server-name:hostname' '/cert:tofu' '/from-stdin[:force]' '/title:title'
     exit 0
 fi
 

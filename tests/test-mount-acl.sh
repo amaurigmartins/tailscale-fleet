@@ -70,13 +70,16 @@ pass 'mount updates are unique and invalid drives, hosts, and traversal are reje
 
 derived="$(bash -c 'source "$1"; TS_MOUNT_ROOT=/tmp/fleet; mount_local_path host1 drive_d' bash "$TS")"
 [[ "$derived" == /tmp/fleet/host1/drive_d ]] || fail "unexpected mount path: $derived"
-pass 'mountpoint derivation is deterministic'
+actual_derived="$(bash -c 'source "$1"; TS_MOUNT_ROOT=/tmp/fleet; mount_actual_path host1 drive_d' bash "$TS")"
+[[ "$actual_derived" == '/tmp/fleet/host1/drive_d on host1' ]] \
+    || fail "unexpected Files-facing mount path: $actual_derived"
+pass 'canonical and Files-facing mountpoint derivation is deterministic'
 
 : > "$MOCK_SSHFS_LOG"
 : > "$MOCK_MOUNT_STATE"
 "$TS" mount win drive_d -- -o cache=yes >/dev/null
 assert_line "$MOCK_SSHFS_LOG" 'Alice@win.tail.example:/D:/'
-assert_line "$MOCK_SSHFS_LOG" "$TS_MOUNT_ROOT/win/drive_d"
+assert_line "$MOCK_SSHFS_LOG" "$TS_MOUNT_ROOT/win/drive_d on win"
 assert_line "$MOCK_SSHFS_LOG" "ProxyCommand=$TS nc %h %p"
 assert_line "$MOCK_SSHFS_LOG" reconnect
 assert_line "$MOCK_SSHFS_LOG" ServerAliveInterval=15
@@ -85,6 +88,9 @@ assert_line "$MOCK_SSHFS_LOG" fsname=tailscale-fleet/win/drive_d
 [[ "$(tail -n 2 "$MOCK_SSHFS_LOG")" == $'-o\ncache=yes' ]] \
     || fail 'invocation SSHFS arguments were not appended last'
 if grep -Fqx -- sudo "$MOCK_SSHFS_LOG"; then fail 'mount command invoked sudo'; fi
+[[ -L "$TS_MOUNT_ROOT/win/drive_d" ]] || fail 'canonical mount path is not a compatibility symlink'
+[[ "$(readlink "$TS_MOUNT_ROOT/win/drive_d")" == 'drive_d on win' ]] \
+    || fail 'compatibility symlink does not target the Files-facing mountpoint'
 before_lines="$(wc -l < "$MOCK_SSHFS_LOG")"
 "$TS" mount win drive_d >/dev/null
 [[ "$(wc -l < "$MOCK_SSHFS_LOG")" -eq "$before_lines" ]] \
@@ -104,6 +110,23 @@ before_lines="$(wc -l < "$MOCK_FUSERMOUNT_LOG")"
     || fail 'already-unmounted invocation called fusermount again'
 pass 'managed unmount is safe and idempotent'
 
+rm -f -- "$TS_MOUNT_ROOT/win/drive_d"
+rmdir -- "$TS_MOUNT_ROOT/win/drive_d on win"
+mkdir -p -- "$TS_MOUNT_ROOT/win/drive_d"
+printf '%s|fuse.sshfs|%s\n' \
+    "$TS_MOUNT_ROOT/win/drive_d" 'tailscale-fleet/win/drive_d' > "$MOCK_MOUNT_STATE"
+: > "$MOCK_SSHFS_LOG"
+legacy_output="$("$TS" mount win drive_d 2>&1)"
+assert_contains "$legacy_output" 'legacy Files label'
+[[ ! -s "$MOCK_SSHFS_LOG" ]] || fail 'legacy active mount was mounted a second time'
+assert_contains "$("$TS" mounts)" 'mounted-legacy-label'
+"$TS" unmount win drive_d >/dev/null
+"$TS" mount win drive_d >/dev/null
+[[ -L "$TS_MOUNT_ROOT/win/drive_d" ]] || fail 'legacy mountpoint was not migrated to a symlink'
+assert_line "$MOCK_MOUNT_STATE" "$TS_MOUNT_ROOT/win/drive_d on win|fuse.sshfs|tailscale-fleet/win/drive_d"
+"$TS" unmount win drive_d >/dev/null
+pass 'legacy mounts remain manageable and migrate after explicit unmount/remount'
+
 "$TS" mount add win drive_c --drive C >/dev/null
 "$TS" mount add win drive_f --drive F >/dev/null
 : > "$MOCK_MOUNT_STATE"
@@ -111,18 +134,25 @@ pass 'managed unmount is safe and idempotent'
 export MOCK_SSHFS_FAIL_SHARE=drive_c
 expect_failure "$TEST_ROOT/batch-failure" "$TS" mount --all
 unset MOCK_SSHFS_FAIL_SHARE
-assert_line "$MOCK_MOUNT_STATE" "$TS_MOUNT_ROOT/linux/home|fuse.sshfs|tailscale-fleet/linux/home"
-assert_line "$MOCK_MOUNT_STATE" "$TS_MOUNT_ROOT/win/drive_d|fuse.sshfs|tailscale-fleet/win/drive_d"
-assert_line "$MOCK_MOUNT_STATE" "$TS_MOUNT_ROOT/win/drive_f|fuse.sshfs|tailscale-fleet/win/drive_f"
+assert_line "$MOCK_MOUNT_STATE" "$TS_MOUNT_ROOT/linux/home on linux|fuse.sshfs|tailscale-fleet/linux/home"
+assert_line "$MOCK_MOUNT_STATE" "$TS_MOUNT_ROOT/win/drive_d on win|fuse.sshfs|tailscale-fleet/win/drive_d"
+assert_line "$MOCK_MOUNT_STATE" "$TS_MOUNT_ROOT/win/drive_f on win|fuse.sshfs|tailscale-fleet/win/drive_f"
 assert_contains "$(cat "$TEST_ROOT/batch-failure")" 'mount failed for win/drive_c'
 "$TS" unmount --all >/dev/null
 pass 'global batch mount continues after failure and global unmount processes every share'
 
-printf '%s|ext4|/dev/mock\n' "$TS_MOUNT_ROOT/win/drive_d" > "$MOCK_MOUNT_STATE"
+printf '%s|ext4|/dev/mock\n' "$TS_MOUNT_ROOT/win/drive_d on win" > "$MOCK_MOUNT_STATE"
 expect_failure "$TEST_ROOT/occupied" "$TS" mount win drive_d
 assert_contains "$(cat "$TEST_ROOT/occupied")" 'occupied by an incompatible filesystem'
 : > "$MOCK_MOUNT_STATE"
 pass 'incompatible mountpoints are refused'
+
+touch "$TS_MOUNT_ROOT/win/drive_d on win/local-data"
+expect_failure "$TEST_ROOT/local-data" "$TS" mount win drive_d
+assert_contains "$(cat "$TEST_ROOT/local-data")" 'refusing to hide local data'
+[[ -f "$TS_MOUNT_ROOT/win/drive_d on win/local-data" ]] || fail 'local mountpoint data was removed'
+rm -f -- "$TS_MOUNT_ROOT/win/drive_d on win/local-data"
+pass 'Files-facing compatibility migration never hides or deletes local data'
 
 INSTALL_ROOT="$TEST_ROOT/install-case"
 mkdir -p "$INSTALL_ROOT/home" "$INSTALL_ROOT/old-source" "$INSTALL_ROOT/new-source" "$INSTALL_ROOT/conflict-source"
